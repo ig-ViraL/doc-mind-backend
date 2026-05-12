@@ -76,7 +76,16 @@ class QueryRequest(BaseModel):
         default=None,
         description="Restrict search to these document IDs. None = search all.",
     )
-    k: int = Field(default=5, ge=1, le=20, description="Number of chunks to retrieve")
+    k: int = Field(
+        default=5,
+        ge=1,
+        le=10,
+        description=(
+            "Number of top-ranked chunks sent to the LLM. "
+            "The pipeline always retrieves a larger candidate pool internally "
+            "and reranks before truncating to this value."
+        ),
+    )
 
 
 class SourceChunk(BaseModel):
