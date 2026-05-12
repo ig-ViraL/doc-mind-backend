@@ -44,6 +44,26 @@ class UploadResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Chunk schemas
+# ---------------------------------------------------------------------------
+
+
+class ChunkResponse(BaseModel):
+    chunk_index: int
+    text: str
+    start_char: int
+    end_char: int
+
+    model_config = {"from_attributes": True}
+
+
+class DocumentChunksResponse(BaseModel):
+    document_id: str
+    filename: str
+    chunks: list[ChunkResponse]
+
+
+# ---------------------------------------------------------------------------
 # Query schemas
 # ---------------------------------------------------------------------------
 
@@ -64,7 +84,7 @@ class SourceChunk(BaseModel):
 
     chunk_index: int
     text: str
-    similarity: float
+    score: float
     document_id: str
     filename: str
 

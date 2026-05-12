@@ -143,6 +143,15 @@ async def init_db() -> None:
         await conn.run_sync(Base.metadata.create_all)
         logger.info("Database tables created / verified")
 
+        # GIN index for full-text search (idempotent — IF NOT EXISTS)
+        await conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_chunks_text_gin "
+                "ON chunks USING GIN (to_tsvector('english', text))"
+            )
+        )
+        logger.info("FTS GIN index ensured")
+
 
 # ---------------------------------------------------------------------------
 # FastAPI dependency

@@ -10,10 +10,12 @@ import logging
 import uuid
 from typing import Any
 
-from sqlalchemy import func, literal_column, select, text
+from sqlalchemy import String, bindparam, func, literal_column, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.database import Chunk, Document
+
+_RRF_K_DEFAULT = 60
 
 logger = logging.getLogger(__name__)
 
@@ -189,6 +191,53 @@ async def get_all_documents(session: AsyncSession) -> list[dict[str, Any]]:
     return docs
 
 
+async def get_document_chunks(
+    session: AsyncSession,
+    document_id: str,
+) -> tuple[str | None, list[dict[str, Any]]]:
+    """
+    Return (filename, chunks) for the given document, ordered by chunk_index.
+    Returns (None, []) if the document does not exist.
+    """
+    stmt = (
+        select(
+            Document.filename,
+            Chunk.chunk_index,
+            Chunk.text,
+            Chunk.start_char,
+            Chunk.end_char,
+        )
+        .join(Chunk, Chunk.document_id == Document.id)
+        .where(Document.id == document_id)
+        .order_by(Chunk.chunk_index)
+    )
+
+    result = await session.execute(stmt)
+    rows = result.fetchall()
+
+    if not rows:
+        # Distinguish "doc exists, zero chunks" from "doc not found"
+        doc_stmt = select(Document.filename).where(Document.id == document_id)
+        doc_result = await session.execute(doc_stmt)
+        doc_row = doc_result.scalar_one_or_none()
+        if doc_row is None:
+            return None, []
+        return doc_row, []
+
+    filename = rows[0].filename
+    chunks = [
+        {
+            "chunk_index": row.chunk_index,
+            "text": row.text,
+            "start_char": row.start_char,
+            "end_char": row.end_char,
+        }
+        for row in rows
+    ]
+    logger.debug("get_document_chunks: doc=%s chunks=%d", document_id, len(chunks))
+    return filename, chunks
+
+
 async def delete_document(session: AsyncSession, document_id: str) -> bool:
     """
     Delete a document and all its chunks (cascaded by FK constraint).
@@ -208,3 +257,152 @@ async def delete_document(session: AsyncSession, document_id: str) -> bool:
     await session.flush()
     logger.info("Deleted document id=%s and its chunks", document_id)
     return True
+
+
+# ---------------------------------------------------------------------------
+# Lexical search (PostgreSQL full-text search)
+# ---------------------------------------------------------------------------
+
+
+async def lexical_search(
+    session: AsyncSession,
+    query: str,
+    k: int = 5,
+    document_ids: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Full-text search using PostgreSQL's tsvector/tsquery machinery.
+
+    Uses websearch_to_tsquery so the caller can pass raw user input safely
+    (it tolerates unbalanced quotes, stopword-only queries, etc.).
+    Ranks results with ts_rank_cd (cover-density ranking).
+
+    Returns a list of dicts with keys:
+        chunk_index, text, fts_rank, document_id, filename
+    Returns an empty list when no FTS matches exist.
+    """
+    # 'english' is a hardcoded regconfig literal — not user input.
+    lang = literal_column("'english'")
+    fts_query_param = bindparam("fts_query", value=query, type_=String)
+
+    tsvec = func.to_tsvector(lang, Chunk.text)
+    tsquery = func.websearch_to_tsquery(lang, fts_query_param)
+
+    rank_col = func.ts_rank_cd(tsvec, tsquery).label("fts_rank")
+    match_cond = tsvec.op("@@")(tsquery)
+
+    stmt = (
+        select(
+            Chunk.chunk_index,
+            Chunk.text,
+            Chunk.document_id,
+            Document.filename,
+            rank_col,
+        )
+        .join(Document, Chunk.document_id == Document.id)
+        .where(match_cond)
+        .order_by(rank_col.desc())
+        .limit(k)
+    )
+
+    if document_ids:
+        stmt = stmt.where(Chunk.document_id.in_(document_ids))
+
+    try:
+        result = await session.execute(stmt)
+        rows = result.fetchall()
+    except Exception as exc:
+        logger.warning("lexical_search failed (%s) — returning empty result", exc)
+        return []
+
+    hits: list[dict[str, Any]] = []
+    for row in rows:
+        hits.append(
+            {
+                "chunk_index": row.chunk_index,
+                "text": row.text,
+                "fts_rank": float(row.fts_rank),
+                "document_id": row.document_id,
+                "filename": row.filename,
+            }
+        )
+
+    logger.debug("lexical_search returned %d results for k=%d", len(hits), k)
+    return hits
+
+
+# ---------------------------------------------------------------------------
+# Hybrid search — vector + lexical via Reciprocal Rank Fusion
+# ---------------------------------------------------------------------------
+
+
+async def hybrid_search(
+    session: AsyncSession,
+    query: str,
+    query_embedding: list[float],
+    k: int = 5,
+    document_ids: list[str] | None = None,
+    rrf_k: int = _RRF_K_DEFAULT,
+) -> list[dict[str, Any]]:
+    """
+    Retrieve chunks by combining vector similarity and full-text search
+    using Reciprocal Rank Fusion (RRF).
+
+    Each retrieval arm produces a ranked list; the RRF score for a chunk at
+    rank r (0-indexed) is  1 / (rrf_k + r + 1).  Scores from both arms are
+    summed, then the top-k results are returned.
+
+    Args:
+        query:           Raw natural-language query (used for FTS).
+        query_embedding: 384-dim embedding vector (used for ANN search).
+        k:               Final number of chunks to return.
+        document_ids:    Optional document filter.
+        rrf_k:           RRF smoothing constant (default 60).
+
+    Returns a list of dicts (same shape as similarity_search) with
+    ``similarity`` set to the fused RRF score.
+    """
+    fetch_k = min(k * 3, 50)  # over-fetch so fusion has enough candidates
+
+    vector_hits = await similarity_search(
+        session, query_embedding, k=fetch_k, document_ids=document_ids
+    )
+    lexical_hits = await lexical_search(
+        session, query, k=fetch_k, document_ids=document_ids
+    )
+
+    logger.debug(
+        "hybrid_search: vector=%d hits, lexical=%d hits",
+        len(vector_hits),
+        len(lexical_hits),
+    )
+
+    # RRF: accumulate 1/(rrf_k + rank + 1) from each arm
+    scores: dict[str, float] = {}
+    chunk_data: dict[str, dict[str, Any]] = {}
+
+    for rank, chunk in enumerate(vector_hits):
+        key = f"{chunk['document_id']}:{chunk['chunk_index']}"
+        scores[key] = scores.get(key, 0.0) + 1.0 / (rrf_k + rank + 1)
+        chunk_data[key] = chunk  # prefer vector hit data (has raw similarity)
+
+    for rank, chunk in enumerate(lexical_hits):
+        key = f"{chunk['document_id']}:{chunk['chunk_index']}"
+        scores[key] = scores.get(key, 0.0) + 1.0 / (rrf_k + rank + 1)
+        if key not in chunk_data:
+            chunk_data[key] = chunk
+
+    top_keys = sorted(scores, key=lambda ck: scores[ck], reverse=True)[:k]
+
+    fused: list[dict[str, Any]] = []
+    for key in top_keys:
+        entry = {**chunk_data[key], "score": round(scores[key], 6)}
+        fused.append(entry)
+
+    logger.info(
+        "hybrid_search returning %d fused chunks (vector=%d, lexical=%d)",
+        len(fused),
+        len(vector_hits),
+        len(lexical_hits),
+    )
+    return fused

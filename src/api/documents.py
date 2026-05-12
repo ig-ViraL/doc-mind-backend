@@ -2,9 +2,10 @@
 Document management endpoints.
 
 Routes (mounted at /api by main.py):
-  POST   /documents/upload           — Upload + index a document
-  GET    /documents                  — List all documents with chunk counts
-  DELETE /documents/{document_id}    — Delete document and its chunks
+  POST   /documents/upload                    — Upload + index a document
+  GET    /documents                           — List all documents with chunk counts
+  GET    /documents/{document_id}/chunks      — List all chunks for a document
+  DELETE /documents/{document_id}             — Delete document and its chunks
 """
 
 from __future__ import annotations
@@ -15,7 +16,13 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.database import get_db
-from models.schemas import DocumentListResponse, DocumentResponse, UploadResponse
+from models.schemas import (
+    ChunkResponse,
+    DocumentChunksResponse,
+    DocumentListResponse,
+    DocumentResponse,
+    UploadResponse,
+)
 from services import chunker as chunker_module
 from services.embedder import embedder
 from services import parser as parser_module
@@ -126,6 +133,34 @@ async def list_documents(
     docs = await vector_store.get_all_documents(session)
     return DocumentListResponse(
         documents=[DocumentResponse(**d) for d in docs]
+    )
+
+
+# ---------------------------------------------------------------------------
+# GET /documents/{document_id}/chunks
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/documents/{document_id}/chunks",
+    response_model=DocumentChunksResponse,
+    summary="List all chunks for a document",
+)
+async def get_document_chunks(
+    document_id: str,
+    session: AsyncSession = Depends(get_db),
+) -> DocumentChunksResponse:
+    """Return every chunk stored for the given document, ordered by chunk_index."""
+    filename, chunks = await vector_store.get_document_chunks(session, document_id)
+    if filename is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Document '{document_id}' not found.",
+        )
+    return DocumentChunksResponse(
+        document_id=document_id,
+        filename=filename,
+        chunks=[ChunkResponse(**c) for c in chunks],
     )
 
 

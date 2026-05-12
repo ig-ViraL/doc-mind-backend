@@ -29,5 +29,9 @@ class Settings(BaseSettings):
     chunk_size: int = 512
     chunk_overlap: int = 50
 
+    # Hybrid search — Reciprocal Rank Fusion constant.
+    # Higher values reduce the ranking advantage of top results.
+    rrf_k: int = 60
+
 
 settings = Settings()

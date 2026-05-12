@@ -22,7 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from config import settings
 from models.schemas import QueryResponse, SourceChunk
 from services.embedder import embedder
-from services.vector_store import similarity_search
+from services.vector_store import hybrid_search
 
 logger = logging.getLogger(__name__)
 
@@ -138,17 +138,19 @@ async def answer_query(
     logger.debug("Query embedded (%d dims)", len(query_embedding))
 
     # ------------------------------------------------------------------
-    # 2. Similarity search
+    # 2. Hybrid search (vector + lexical, fused via RRF)
     # ------------------------------------------------------------------
-    raw_chunks = await similarity_search(
+    raw_chunks = await hybrid_search(
         session=session,
+        query=query,
         query_embedding=query_embedding,
         k=k,
         document_ids=document_ids,
+        rrf_k=settings.rrf_k,
     )
     logger.info("Retrieved %d chunks for query (k=%d)", len(raw_chunks), k)
     for c in raw_chunks:
-        logger.debug("  chunk=%d sim=%.4f file=%s", c["chunk_index"], c["similarity"], c["filename"])
+        logger.debug("  chunk=%d rrf=%.6f file=%s", c["chunk_index"], c["score"], c["filename"])
 
     # ------------------------------------------------------------------
     # 3. Cross-encoder reranking
@@ -197,7 +199,7 @@ async def answer_query(
         SourceChunk(
             chunk_index=chunk["chunk_index"],
             text=chunk["text"],
-            similarity=chunk["similarity"],
+            score=chunk["score"],
             document_id=chunk["document_id"],
             filename=chunk["filename"],
         )
