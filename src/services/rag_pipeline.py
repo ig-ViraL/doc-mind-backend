@@ -13,6 +13,7 @@ Flow:
 from __future__ import annotations
 
 import logging
+import re
 import time
 from typing import Any
 
@@ -22,29 +23,50 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from config import settings
 from models.schemas import QueryResponse, SourceChunk
 from services.embedder import embedder
-from services.vector_store import similarity_search
+from services.llm_client import get_openrouter_client
+from services.vector_store import hybrid_search
 
 logger = logging.getLogger(__name__)
 
+
 # ---------------------------------------------------------------------------
-# OpenRouter client (module-level singleton)
+# Meta-query detection — bypass retrieval for questions about the assistant
 # ---------------------------------------------------------------------------
 
-_openrouter_client: openai.AsyncOpenAI | None = None
+_META_QUERY_RE = re.compile(
+    r"""
+    ^\s*(
+        (who|what)\s+are\s+you                  |
+        what\s+(can|do)\s+you\s+(do|help)       |
+        tell\s+me\s+about\s+yourself            |
+        introduce\s+yourself                     |
+        your\s+(name|purpose|role|capabilities?) |
+        what\s+is\s+(your\s+name|docmind)       |
+        (hi|hello|hey|howdy)\b                  |
+        ^help$
+    )\s*[?!.]?\s*$
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+_DOCMIND_INTRO = (
+    "I'm DocMind, an intelligent document assistant. "
+    "I answer questions using only the content of documents you upload — "
+    "I don't draw on outside knowledge or make things up.\n\n"
+    "Here's what I can do:\n"
+    "- Answer questions across one or more uploaded documents\n"
+    "- Reason accurately over tables and structured data\n"
+    "- Understand images and charts via AI-generated descriptions\n"
+    "- Recognise hyperlinks referenced in your documents\n"
+    "- Synthesise information across multiple files\n\n"
+    "Supported formats: PDF, DOCX, TXT.\n\n"
+    "Upload a document and ask me anything about its content."
+)
 
 
-def _get_openrouter_client() -> openai.AsyncOpenAI:
-    global _openrouter_client
-    if _openrouter_client is None:
-        _openrouter_client = openai.AsyncOpenAI(
-            api_key=settings.openrouter_api_key,
-            base_url=settings.openrouter_base_url,
-            default_headers={
-                "HTTP-Referer": "https://github.com/docmind",
-                "X-Title": "DocMind RAG",
-            },
-        )
-    return _openrouter_client
+def _is_meta_query(query: str) -> bool:
+    """Return True if the query is about the assistant itself, not a document."""
+    return bool(_META_QUERY_RE.match(query.strip()))
 
 
 # ---------------------------------------------------------------------------
@@ -96,13 +118,39 @@ def _rerank(query: str, chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
 # System prompt
 # ---------------------------------------------------------------------------
 
-_SYSTEM_PROMPT = (
-    "You are a helpful document assistant. Answer questions using the provided context chunks.\n"
-    "You may synthesize and infer from the context — do not require the answer to be stated word-for-word.\n"
-    "If the context contains no relevant information at all, say \"I don't have enough information in the provided documents.\"\n"
-    "Always cite the source chunk index when referencing information (e.g., [Chunk 3]).\n"
-    "Be concise and factual."
-)
+_SYSTEM_PROMPT = """\
+You are DocMind, an intelligent assistant that answers questions strictly from the content of uploaded documents.
+
+Each excerpt you receive is labelled with its source file. Excerpts may contain:
+- Plain text passages
+- Tables in Markdown format (rows and columns of data)
+- Image descriptions prefixed with [IMAGE] (treat these as factual observations)
+- Hyperlinks prefixed with [HYPERLINKS]
+
+How to answer:
+- Use only the provided excerpts. Do not use outside knowledge or make up facts.
+- Synthesise across multiple excerpts and sources when the answer spans them.
+- Cite the source file name in parentheses when referencing a specific fact — e.g. (resume.pdf) — not a chunk or page number.
+- When an excerpt contains a table, reason accurately over its values; do not paraphrase incorrectly.
+- When an excerpt describes an image or chart, treat that description as ground truth.
+- Write naturally and directly. Do not start answers with "Based on the context..." or "According to the documents...".
+- Do not expose internal labels like chunk numbers or page numbers unless they are meaningful to the user.
+
+Hard scope limits — never cross these:
+- Do NOT write, generate, or produce any content (code, essays, summaries, plans) that is not directly extracted or paraphrased from the uploaded documents.
+- Do NOT offer to generate something "for the user" as an alternative when the documents lack the answer.
+- Do NOT answer general-knowledge questions, perform calculations, or act as a general-purpose assistant.
+- If the uploaded documents happen to contain code, you may explain or quote that code. You may not write new code.
+
+When the excerpts do not fully cover the question:
+- Answer what you can from what is available.
+- Clearly state that the information is not present in the uploaded documents.
+- If helpful, suggest a more specific question that the documents could plausibly answer — only if such a question exists.
+- Never offer to generate, write, or produce anything as a substitute.
+
+If the user asks who you are or about your capabilities, always identify yourself as DocMind — \
+never as a person or entity described in the documents.\
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +179,17 @@ async def answer_query(
     start_time = time.perf_counter()
 
     # ------------------------------------------------------------------
+    # 0. Short-circuit: meta / identity queries never touch retrieval
+    # ------------------------------------------------------------------
+    if _is_meta_query(query):
+        logger.info("Meta query detected — skipping retrieval")
+        return QueryResponse(
+            answer=_DOCMIND_INTRO,
+            sources=[],
+            latency_ms=round((time.perf_counter() - start_time) * 1000, 2),
+        )
+
+    # ------------------------------------------------------------------
     # 1. Embed the query
     # ------------------------------------------------------------------
     query_vectors = embedder.embed([query])
@@ -138,42 +197,64 @@ async def answer_query(
     logger.debug("Query embedded (%d dims)", len(query_embedding))
 
     # ------------------------------------------------------------------
-    # 2. Similarity search
+    # 2. Hybrid search over a larger candidate pool
     # ------------------------------------------------------------------
-    raw_chunks = await similarity_search(
+    # retrieval_k is always >= k so reranking has more to work with.
+    retrieval_k = max(settings.retrieval_k, k)
+    raw_chunks = await hybrid_search(
         session=session,
+        query=query,
         query_embedding=query_embedding,
-        k=k,
+        k=retrieval_k,
         document_ids=document_ids,
+        rrf_k=settings.rrf_k,
     )
-    logger.info("Retrieved %d chunks for query (k=%d)", len(raw_chunks), k)
+    logger.info(
+        "Retrieved %d candidates (retrieval_k=%d, context_k=%d)",
+        len(raw_chunks), retrieval_k, k,
+    )
     for c in raw_chunks:
-        logger.debug("  chunk=%d sim=%.4f file=%s", c["chunk_index"], c["similarity"], c["filename"])
+        logger.debug("  chunk=%d rrf=%.6f file=%s", c["chunk_index"], c["score"], c["filename"])
 
     # ------------------------------------------------------------------
-    # 3. Cross-encoder reranking
+    # 3. Cross-encoder reranking over full candidate pool
     # ------------------------------------------------------------------
-    ranked_chunks = _rerank(query, raw_chunks)
+    reranked_chunks = _rerank(query, raw_chunks)
+
+    # ------------------------------------------------------------------
+    # 3b. Truncate to context_k — only the top-k go to the LLM
+    # ------------------------------------------------------------------
+    ranked_chunks = reranked_chunks[:k]
+    logger.info(
+        "Truncated to %d chunks for LLM context (dropped %d after reranking)",
+        len(ranked_chunks), len(reranked_chunks) - len(ranked_chunks),
+    )
 
     # ------------------------------------------------------------------
     # 4. Build context string
     # ------------------------------------------------------------------
     if ranked_chunks:
         context_parts: list[str] = []
-        for i, chunk in enumerate(ranked_chunks):
-            context_parts.append(
-                f"Chunk {i} (from {chunk['filename']}):\n{chunk['text']}"
-            )
-        context = "\n\n".join(context_parts)
-        user_message = f"Context:\n{context}\n\nQuestion: {query}"
+        for chunk in ranked_chunks:
+            context_parts.append(f"[Source: {chunk['filename']}]\n{chunk['text']}")
+        context = "\n\n---\n\n".join(context_parts)
+        user_message = f"Document excerpts:\n\n{context}\n\nQuestion: {query}"
     else:
-        user_message = f"Question: {query}"
-        logger.warning("No chunks retrieved — asking Claude without context")
+        # No chunks at all — guide the LLM to produce a useful non-answer
+        # rather than hallucinating or giving a generic refusal.
+        logger.warning("No chunks retrieved — asking LLM to respond constructively")
+        user_message = (
+            f"Question: {query}\n\n"
+            "No relevant excerpts were found in the indexed documents for this question. "
+            "Politely explain that the uploaded documents do not contain information relevant "
+            "to this question. Do not offer to answer it yourself, generate content, or help "
+            "in any way that goes beyond the document content."
+        )
 
     # ------------------------------------------------------------------
     # 5. Call LLM via OpenRouter
     # ------------------------------------------------------------------
-    client = _get_openrouter_client()
+    client = get_openrouter_client()
     try:
         response = await client.chat.completions.create(
             model=settings.openrouter_model,
@@ -197,7 +278,7 @@ async def answer_query(
         SourceChunk(
             chunk_index=chunk["chunk_index"],
             text=chunk["text"],
-            similarity=chunk["similarity"],
+            score=chunk["score"],
             document_id=chunk["document_id"],
             filename=chunk["filename"],
         )

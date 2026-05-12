@@ -44,6 +44,26 @@ class UploadResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Chunk schemas
+# ---------------------------------------------------------------------------
+
+
+class ChunkResponse(BaseModel):
+    chunk_index: int
+    text: str
+    start_char: int
+    end_char: int
+
+    model_config = {"from_attributes": True}
+
+
+class DocumentChunksResponse(BaseModel):
+    document_id: str
+    filename: str
+    chunks: list[ChunkResponse]
+
+
+# ---------------------------------------------------------------------------
 # Query schemas
 # ---------------------------------------------------------------------------
 
@@ -56,7 +76,16 @@ class QueryRequest(BaseModel):
         default=None,
         description="Restrict search to these document IDs. None = search all.",
     )
-    k: int = Field(default=5, ge=1, le=20, description="Number of chunks to retrieve")
+    k: int = Field(
+        default=5,
+        ge=1,
+        le=10,
+        description=(
+            "Number of top-ranked chunks sent to the LLM. "
+            "The pipeline always retrieves a larger candidate pool internally "
+            "and reranks before truncating to this value."
+        ),
+    )
 
 
 class SourceChunk(BaseModel):
@@ -64,7 +93,7 @@ class SourceChunk(BaseModel):
 
     chunk_index: int
     text: str
-    similarity: float
+    score: float
     document_id: str
     filename: str
 

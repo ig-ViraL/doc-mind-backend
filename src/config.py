@@ -25,9 +25,18 @@ class Settings(BaseSettings):
     embedding_model: str = "all-MiniLM-L6-v2"
 
     # RAG parameters
-    top_k: int = 5
+    top_k: int = 5          # chunks sent to LLM (context window size)
+    retrieval_k: int = 12   # candidate pool fetched + reranked before truncation
     chunk_size: int = 512
     chunk_overlap: int = 50
+
+    # Hybrid search — Reciprocal Rank Fusion constant.
+    # Higher values reduce the ranking advantage of top results.
+    rrf_k: int = 60
+
+    # Phase 2 parsing
+    extract_images: bool = True          # set False to skip vision LLM calls on upload
+    vision_model: str = "anthropic/claude-3.5-sonnet"  # must support vision
 
 
 settings = Settings()
