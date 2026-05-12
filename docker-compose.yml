@@ -1,0 +1,44 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: docmind_postgres
+    environment:
+      POSTGRES_USER: docmind
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: docmind
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U docmind -d docmind"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./src
+      dockerfile: Dockerfile
+    container_name: docmind_backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://docmind:secret@postgres:5432/docmind
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-anthropic/claude-3.5-sonnet}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-all-MiniLM-L6-v2}
+      TOP_K: ${TOP_K:-5}
+      CHUNK_SIZE: ${CHUNK_SIZE:-512}
+      CHUNK_OVERLAP: ${CHUNK_OVERLAP:-50}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./src:/app
+    restart: unless-stopped
+
+volumes:
+  postgres_data:

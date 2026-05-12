@@ -1,0 +1,21 @@
+{
+  "enabledPlugins": {
+    "fullstack-engineer@claude-code-skills": true,
+    "document-skills@anthropic-agent-skills": true,
+    "example-skills@anthropic-agent-skills": true
+  },
+  "autoInvokeSkills": {
+    "frontend-design": {
+      "trigger": "Writing or redesigning any React component, page, layout, or UI element in this Next.js project",
+      "plugin": "document-skills@anthropic-agent-skills"
+    },
+    "webapp-testing": {
+      "trigger": "Verifying feature functionality in the browser or running the dev server UI tests",
+      "plugin": "document-skills@anthropic-agent-skills"
+    },
+    "claude-api": {
+      "trigger": "Any work touching lib/model.ts, AI SDK imports, Anthropic SDK, or LLM provider config",
+      "plugin": "document-skills@anthropic-agent-skills"
+    }
+  }
+}
