@@ -74,7 +74,11 @@ def _is_meta_query(query: str) -> bool:
 # ---------------------------------------------------------------------------
 
 _cross_encoder: Any | None = None
-_CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+
+
+def warm_up_cross_encoder() -> None:
+    """Pre-load the cross-encoder so the first request isn't slow."""
+    _get_cross_encoder()
 
 
 def _get_cross_encoder() -> Any:
@@ -83,8 +87,8 @@ def _get_cross_encoder() -> Any:
         try:
             from sentence_transformers import CrossEncoder
 
-            logger.info("Loading cross-encoder model: %s", _CROSS_ENCODER_MODEL)
-            _cross_encoder = CrossEncoder(_CROSS_ENCODER_MODEL)
+            logger.info("Loading cross-encoder model: %s", settings.cross_encoder_model)
+            _cross_encoder = CrossEncoder(settings.cross_encoder_model)
             logger.info("Cross-encoder model loaded")
         except Exception as exc:
             logger.warning("Failed to load cross-encoder (%s) — reranking disabled", exc)

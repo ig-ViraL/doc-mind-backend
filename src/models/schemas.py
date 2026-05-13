@@ -5,7 +5,6 @@ Pydantic v2 request / response models for the DocMind API.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Optional
 
 from pydantic import BaseModel, Field
 
@@ -16,27 +15,21 @@ from pydantic import BaseModel, Field
 
 
 class DocumentResponse(BaseModel):
-    """Single document representation returned to callers."""
-
     id: str
     filename: str
     file_type: str
     page_count: int
     uploaded_at: datetime
-    chunk_count: Optional[int] = None
+    chunk_count: int | None = None
 
     model_config = {"from_attributes": True}
 
 
 class DocumentListResponse(BaseModel):
-    """Paginated (or full) list of documents."""
-
     documents: list[DocumentResponse]
 
 
 class UploadResponse(BaseModel):
-    """Returned after a successful document upload + indexing."""
-
     document_id: str
     filename: str
     chunk_count: int
@@ -69,10 +62,8 @@ class DocumentChunksResponse(BaseModel):
 
 
 class QueryRequest(BaseModel):
-    """Incoming RAG query."""
-
     query: str = Field(..., min_length=1, description="The natural-language question")
-    document_ids: Optional[list[str]] = Field(
+    document_ids: list[str] | None = Field(
         default=None,
         description="Restrict search to these document IDs. None = search all.",
     )
@@ -89,8 +80,6 @@ class QueryRequest(BaseModel):
 
 
 class SourceChunk(BaseModel):
-    """A single retrieved chunk included in the query response."""
-
     chunk_index: int
     text: str
     score: float
@@ -99,8 +88,6 @@ class SourceChunk(BaseModel):
 
 
 class QueryResponse(BaseModel):
-    """Full answer with cited source chunks and observability data."""
-
     answer: str
     sources: list[SourceChunk]
     latency_ms: float

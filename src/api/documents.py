@@ -32,7 +32,6 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["documents"])
 
-# Default chunker instance
 _chunker = chunker_module.RecursiveCharacterChunker()
 
 
