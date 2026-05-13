@@ -9,22 +9,17 @@ Two implementations:
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, TypedDict
 
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Chunk dict shape
-# ---------------------------------------------------------------------------
-# {
-#   "text": str,
-#   "chunk_index": int,
-#   "start_char": int,
-#   "end_char": int,
-#   "document_id": str,
-# }
-ChunkDict = dict[str, Any]
+class ChunkDict(TypedDict):
+    text: str
+    chunk_index: int
+    start_char: int
+    end_char: int
+    document_id: str
 
 
 # ---------------------------------------------------------------------------
@@ -74,7 +69,6 @@ class RecursiveCharacterChunker:
                 }
             )
 
-        # Re-index after filtering empties
         for idx, chunk in enumerate(result):
             chunk["chunk_index"] = idx
 
@@ -126,7 +120,7 @@ class RecursiveCharacterChunker:
             if positions:
                 break
 
-        # Fallback: split every chunk_size chars if no separators found
+        # No separator found — hard-split at chunk_size boundaries
         if not positions and len(text) > self.chunk_size:
             positions = list(range(self.chunk_size, len(text), self.chunk_size))
 
@@ -242,7 +236,6 @@ class SemanticChunker:
                 if sent.strip():
                     sentences.append((sent, start))
                 start = i + 2
-        # Tail
         tail = text[start:]
         if tail.strip():
             sentences.append((tail, start))

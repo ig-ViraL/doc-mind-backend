@@ -15,8 +15,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.database import Chunk, Document
 
-_RRF_K_DEFAULT = 60
-
 logger = logging.getLogger(__name__)
 
 
@@ -342,7 +340,7 @@ async def hybrid_search(
     query_embedding: list[float],
     k: int = 5,
     document_ids: list[str] | None = None,
-    rrf_k: int = _RRF_K_DEFAULT,
+    rrf_k: int = 60,
 ) -> list[dict[str, Any]]:
     """
     Retrieve chunks by combining vector similarity and full-text search

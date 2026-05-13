@@ -12,6 +12,7 @@ Health check:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import logging.config
 import time
@@ -26,6 +27,8 @@ from api.documents import router as documents_router
 from api.query import router as query_router
 from config import settings
 from db.database import AsyncSessionLocal, init_db
+from services.embedder import warm_up as warm_up_embedder
+from services.rag_pipeline import warm_up_cross_encoder
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -72,12 +75,18 @@ _start_time: float = 0.0
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    """Run DB initialisation on startup; clean up on shutdown."""
+    """Run DB init and model pre-warming on startup; clean up on shutdown."""
     global _start_time
     _start_time = time.time()
     logger.info("DocMind API starting up — initialising database …")
     await init_db()
-    logger.info("Database ready")
+    logger.info("Database ready — pre-warming ML models …")
+    # Both models do blocking file I/O on load; run in thread to keep loop responsive.
+    await asyncio.gather(
+        asyncio.to_thread(warm_up_embedder),
+        asyncio.to_thread(warm_up_cross_encoder),
+    )
+    logger.info("Models ready — API accepting requests")
     yield
     logger.info("DocMind API shutting down")
 

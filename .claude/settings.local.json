@@ -41,7 +41,8 @@
       "PowerShell(pip install *)",
       "PowerShell(pip show *)",
       "PowerShell($env:DATABASE_URL)",
-      "PowerShell(Get-Process *)"
+      "PowerShell(Get-Process *)",
+      "PowerShell(Get-ChildItem -Path \"D:\\\\Work\\\\Projects\\\\docmind\" -Recurse -Force | Select-Object FullName, @{Name=\"SizeKB\";Expression={[math]::Round\\($_.Length/1KB, 2\\)}} | Format-Table -AutoSize)"
     ]
   },
   "outputStyle": "Explanatory",
