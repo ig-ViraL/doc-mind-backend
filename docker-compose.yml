@@ -20,7 +20,7 @@ services:
 
   backend:
     build:
-      context: ./src
+      context: .
       dockerfile: Dockerfile
     container_name: docmind_backend
     depends_on:
