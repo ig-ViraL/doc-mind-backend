@@ -20,12 +20,10 @@ class Settings(BaseSettings):
     @field_validator("database_url", mode="before")
     @classmethod
     def fix_db_driver(cls, v: str) -> str:
-        # Railway/Heroku provide postgres:// or postgresql:// — asyncpg requires +asyncpg
-        if v.startswith("postgres://"):
-            v = v.replace("postgres://", "postgresql+asyncpg://", 1)
-        elif v.startswith("postgresql://"):
-            v = v.replace("postgresql://", "postgresql+asyncpg://", 1)
-        return v
+        import re
+        # Normalize any postgres URL variant to postgresql+asyncpg://.
+        # Handles: postgres://, postgresql://, postgresql+psycopg2://, etc.
+        return re.sub(r"^postgres(?:ql)?(?:\+\w+)?://", "postgresql+asyncpg://", v)
 
     # OpenRouter
     openrouter_api_key: str = ""
