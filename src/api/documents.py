@@ -27,6 +27,7 @@ from services import chunker as chunker_module
 from services.embedder import embedder
 from services import parser as parser_module
 from services import vector_store
+from services.storage import r2_storage
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +57,11 @@ async def upload_document(
     """
     logger.info("Upload request: filename='%s' content_type='%s'", file.filename, file.content_type)
 
-    # 1. Parse
+    # 1. Read bytes upfront (needed for R2 upload; seek back so parser can read normally)
+    file_bytes = await file.read()
+    await file.seek(0)
+
+    # 2. Parse
     try:
         parsed = await parser_module.parse(file)
     except ValueError as exc:
@@ -72,15 +77,30 @@ async def upload_document(
             detail="Uploaded file contains no extractable text.",
         )
 
-    # 2. Save document metadata
+    # 3. Upload original file to Cloudflare R2 (best-effort — indexing continues on failure)
+    file_key: str | None = None
+    file_url: str | None = None
+    if r2_storage.is_enabled():
+        try:
+            file_key, file_url = await r2_storage.upload_file(
+                content=file_bytes,
+                filename=metadata["filename"],
+                mime_type=file.content_type or "application/octet-stream",
+            )
+        except Exception as exc:
+            logger.warning("R2 upload failed (non-fatal): %s", exc)
+
+    # 4. Save document metadata
     doc = await vector_store.save_document(
         session=session,
         filename=metadata["filename"],
         file_type=metadata["file_type"],
         page_count=metadata["page_count"],
+        file_key=file_key,
+        file_url=file_url,
     )
 
-    # 3. Chunk
+    # 5. Chunk
     chunks = _chunker.chunk(text=text, document_id=doc.id)
     if not chunks:
         raise HTTPException(
@@ -88,11 +108,11 @@ async def upload_document(
             detail="Document produced zero chunks after splitting.",
         )
 
-    # 4. Embed (batch)
+    # 6. Embed (batch)
     texts_to_embed = [c["text"] for c in chunks]
-    embeddings = embedder.embed(texts_to_embed)
+    embeddings = await embedder.embed(texts_to_embed)
 
-    # 5. Store chunks + embeddings
+    # 7. Store chunks + embeddings
     chunk_count = await vector_store.save_chunks(
         session=session,
         chunks=chunks,
@@ -101,10 +121,8 @@ async def upload_document(
     )
 
     logger.info(
-        "Document indexed: id=%s filename='%s' chunks=%d",
-        doc.id,
-        doc.filename,
-        chunk_count,
+        "Document indexed: id=%s filename='%s' chunks=%d r2=%s",
+        doc.id, doc.filename, chunk_count, file_key or "none",
     )
 
     return UploadResponse(
@@ -112,6 +130,8 @@ async def upload_document(
         filename=doc.filename,
         chunk_count=chunk_count,
         status="indexed",
+        file_key=file_key,
+        file_url=file_url,
     )
 
 
@@ -181,10 +201,18 @@ async def delete_document(
     Permanently delete the document and all associated chunks.
     Returns 204 on success, 404 if the document does not exist.
     """
-    deleted = await vector_store.delete_document(session, document_id)
-    if not deleted:
+    doc = await vector_store.delete_document(session, document_id)
+    if not doc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Document '{document_id}' not found.",
         )
+
+    # Delete original file from R2 (best-effort)
+    if doc.file_key and r2_storage.is_enabled():
+        try:
+            await r2_storage.delete_file(doc.file_key)
+        except Exception as exc:
+            logger.warning("R2 delete failed for key %s: %s", doc.file_key, exc)
+
     logger.info("Deleted document id=%s", document_id)

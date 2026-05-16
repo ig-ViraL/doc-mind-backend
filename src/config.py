@@ -30,8 +30,10 @@ class Settings(BaseSettings):
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     openrouter_model: str = "meta-llama/llama-3.1-8b-instruct:free"
 
-    # Embedding model
-    embedding_model: str = "all-MiniLM-L6-v2"
+    # Voyage AI embeddings
+    voyage_api_key: str = ""
+    voyage_model: str = "voyage-3-lite"
+    embedding_dim: int = 512  # voyage-3-lite=512, voyage-3/voyage-3-large=1024
 
     # RAG parameters
     top_k: int = 5          # chunks sent to LLM (context window size)
@@ -55,6 +57,13 @@ class Settings(BaseSettings):
 
     # Maximum upload file size in MB
     max_file_size_mb: int = 50
+
+    # Cloudflare R2 storage (optional — omit to disable)
+    cloudfare_account_id: str = ""
+    cloudfare_r2_access_key_id: str = ""      # from R2 → Manage R2 API Tokens
+    cloudfare_r2_secret_access_key: str = ""  # from R2 → Manage R2 API Tokens
+    cloudfare_r2_bucket: str = "docmind"
+    cloudfare_r2_public_url: str = ""  # e.g. https://pub-xxxx.r2.dev (set if bucket is public)
 
 
 settings = Settings()

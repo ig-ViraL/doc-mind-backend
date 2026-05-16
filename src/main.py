@@ -158,7 +158,8 @@ async def server_status() -> dict:
         "database": db_status,
         "database_error": db_error,
         "config": {
-            "embedding_model": settings.embedding_model,
+            "voyage_model": settings.voyage_model,
+            "embedding_dim": settings.embedding_dim,
             "top_k": settings.top_k,
             "chunk_size": settings.chunk_size,
             "chunk_overlap": settings.chunk_overlap,

@@ -196,7 +196,7 @@ async def answer_query(
     # ------------------------------------------------------------------
     # 1. Embed the query
     # ------------------------------------------------------------------
-    query_vectors = embedder.embed([query])
+    query_vectors = await embedder.embed([query], input_type="query")
     query_embedding: list[float] = query_vectors[0]
     logger.debug("Query embedded (%d dims)", len(query_embedding))
 

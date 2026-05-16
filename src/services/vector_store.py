@@ -28,6 +28,8 @@ async def save_document(
     filename: str,
     file_type: str,
     page_count: int,
+    file_key: str | None = None,
+    file_url: str | None = None,
 ) -> Document:
     """
     Insert a new Document row and return the ORM object.
@@ -37,6 +39,8 @@ async def save_document(
         filename=filename,
         file_type=file_type,
         page_count=page_count,
+        file_key=file_key,
+        file_url=file_url,
     )
     session.add(doc)
     await session.flush()  # Populate server-side defaults (uploaded_at)
@@ -162,6 +166,8 @@ async def get_all_documents(session: AsyncSession) -> list[dict[str, Any]]:
             Document.file_type,
             Document.page_count,
             Document.uploaded_at,
+            Document.file_key,
+            Document.file_url,
             func.count(Chunk.id).label("chunk_count"),
         )
         .outerjoin(Chunk, Chunk.document_id == Document.id)
@@ -181,6 +187,8 @@ async def get_all_documents(session: AsyncSession) -> list[dict[str, Any]]:
                 "file_type": row.file_type,
                 "page_count": row.page_count,
                 "uploaded_at": row.uploaded_at,
+                "file_key": row.file_key,
+                "file_url": row.file_url,
                 "chunk_count": row.chunk_count,
             }
         )
@@ -236,25 +244,25 @@ async def get_document_chunks(
     return filename, chunks
 
 
-async def delete_document(session: AsyncSession, document_id: str) -> bool:
+async def delete_document(session: AsyncSession, document_id: str) -> Document | None:
     """
     Delete a document and all its chunks (cascaded by FK constraint).
 
-    Returns True if the document existed and was deleted, False otherwise.
+    Returns the deleted Document so callers can access its file_key before it's gone.
+    Returns None if the document did not exist.
     """
-    # Check existence first
     stmt = select(Document).where(Document.id == document_id)
     result = await session.execute(stmt)
     doc = result.scalar_one_or_none()
 
     if doc is None:
         logger.warning("delete_document: document_id=%s not found", document_id)
-        return False
+        return None
 
     await session.delete(doc)
     await session.flush()
     logger.info("Deleted document id=%s and its chunks", document_id)
-    return True
+    return doc
 
 
 # ---------------------------------------------------------------------------
