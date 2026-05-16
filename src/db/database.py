@@ -78,6 +78,8 @@ class Document(Base):
         server_default=func.now(),
         nullable=False,
     )
+    file_key: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    file_url: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     chunks: Mapped[list["Chunk"]] = relationship(
         "Chunk",
@@ -169,6 +171,14 @@ async def init_db() -> None:
                     "WITH (lists = 100)"
                 ))
                 logger.info("Embedding column migrated to %s", target_type)
+
+        # Add file storage columns to existing documents table (idempotent)
+        await conn.execute(text(
+            "ALTER TABLE documents ADD COLUMN IF NOT EXISTS file_key VARCHAR(1024)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE documents ADD COLUMN IF NOT EXISTS file_url TEXT"
+        ))
 
         # Create tables / indexes that don't exist yet
         await conn.run_sync(Base.metadata.create_all)

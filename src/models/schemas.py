@@ -21,6 +21,8 @@ class DocumentResponse(BaseModel):
     page_count: int
     uploaded_at: datetime
     chunk_count: int | None = None
+    file_key: str | None = None
+    file_url: str | None = None
 
     model_config = {"from_attributes": True}
 
@@ -34,6 +36,8 @@ class UploadResponse(BaseModel):
     filename: str
     chunk_count: int
     status: str = "indexed"
+    file_key: str | None = None
+    file_url: str | None = None
 
 
 # ---------------------------------------------------------------------------

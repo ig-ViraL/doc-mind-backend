@@ -58,5 +58,12 @@ class Settings(BaseSettings):
     # Maximum upload file size in MB
     max_file_size_mb: int = 50
 
+    # Cloudflare R2 storage (optional — omit to disable)
+    cloudfare_account_id: str = ""
+    cloudfare_r2_access_key_id: str = ""      # from R2 → Manage R2 API Tokens
+    cloudfare_r2_secret_access_key: str = ""  # from R2 → Manage R2 API Tokens
+    cloudfare_r2_bucket: str = "docmind"
+    cloudfare_r2_public_url: str = ""  # e.g. https://pub-xxxx.r2.dev (set if bucket is public)
+
 
 settings = Settings()
