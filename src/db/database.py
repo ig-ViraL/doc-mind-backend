@@ -103,8 +103,7 @@ class Chunk(Base):
     )
     chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
     text: Mapped[str] = mapped_column(Text, nullable=False)
-    # Vector(384) — all-MiniLM-L6-v2 output dimension
-    embedding: Mapped[list[float]] = mapped_column(Vector(384), nullable=True)
+    embedding: Mapped[list[float]] = mapped_column(Vector(settings.embedding_dim), nullable=True)
     start_char: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     end_char: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(
@@ -139,7 +138,39 @@ async def init_db() -> None:
         await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
         logger.info("pgvector extension ensured")
 
-        # Create tables
+        # Migrate embedding column dimension if the table already exists with wrong dim.
+        # This happens when switching embedding models (e.g. all-MiniLM-L6-v2 → Voyage AI).
+        # Old embeddings are incompatible anyway, so we NULL them out and retype the column.
+        result = await conn.execute(text(
+            "SELECT format_type(atttypid, atttypmod) "
+            "FROM pg_attribute "
+            "WHERE attrelid = 'chunks'::regclass "
+            "  AND attname = 'embedding' "
+            "  AND attnum > 0 "
+            "  AND NOT attisdropped"
+        ))
+        row = result.fetchone()
+        if row is not None:
+            current_type = row[0]  # e.g. "vector(384)"
+            target_type = f"vector({settings.embedding_dim})"
+            if current_type != target_type:
+                logger.info(
+                    "Embedding column is %s — migrating to %s (old embeddings cleared)",
+                    current_type, target_type,
+                )
+                await conn.execute(text("DROP INDEX IF EXISTS ix_chunks_embedding_ivfflat"))
+                await conn.execute(text("UPDATE chunks SET embedding = NULL"))
+                await conn.execute(text(
+                    f"ALTER TABLE chunks ALTER COLUMN embedding TYPE {target_type}"
+                ))
+                await conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_chunks_embedding_ivfflat "
+                    "ON chunks USING ivfflat (embedding vector_cosine_ops) "
+                    "WITH (lists = 100)"
+                ))
+                logger.info("Embedding column migrated to %s", target_type)
+
+        # Create tables / indexes that don't exist yet
         await conn.run_sync(Base.metadata.create_all)
         logger.info("Database tables created / verified")
 

@@ -90,7 +90,7 @@ async def upload_document(
 
     # 4. Embed (batch)
     texts_to_embed = [c["text"] for c in chunks]
-    embeddings = embedder.embed(texts_to_embed)
+    embeddings = await embedder.embed(texts_to_embed)
 
     # 5. Store chunks + embeddings
     chunk_count = await vector_store.save_chunks(
