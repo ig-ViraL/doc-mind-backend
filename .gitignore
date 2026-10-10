@@ -9,3 +9,5 @@ venv/
 pgdata/
 viral-agents.md
 .claude/settings.local.json
+.neon
+.env.local

@@ -25,7 +25,17 @@ class Settings(BaseSettings):
         import re
         # Normalize any postgres URL variant to postgresql+asyncpg://.
         # Handles: postgres://, postgresql://, postgresql+psycopg2://, etc.
-        return re.sub(r"^postgres(?:ql)?(?:\+\w+)?://", "postgresql+asyncpg://", v)
+        v = re.sub(r"^postgres(?:ql)?(?:\+\w+)?://", "postgresql+asyncpg://", v)
+        # asyncpg rejects libpq-style params (sslmode, channel_binding) that Neon/Railway URLs carry.
+        from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+        parts = urlsplit(v)
+        query = [
+            ("ssl" if k == "sslmode" else k, val)
+            for k, val in parse_qsl(parts.query)
+            if k != "channel_binding"
+        ]
+        return urlunsplit(parts._replace(query=urlencode(query)))
 
     # OpenRouter
     openrouter_api_key: str = ""
@@ -59,6 +69,13 @@ class Settings(BaseSettings):
 
     # Minimum image size in bytes — smaller images (icons, bullets) are skipped
     min_image_bytes: int = 5_000
+
+    # Comma-separated allowed browser origins; "*" allows any (fine for a public demo API)
+    cors_origins: str = "*"
+
+    @property
+    def cors_origin_list(self) -> list[str]:
+        return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
 
     # Maximum upload file size in MB
     max_file_size_mb: int = 50

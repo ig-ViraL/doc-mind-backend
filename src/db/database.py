@@ -146,7 +146,7 @@ async def init_db() -> None:
         result = await conn.execute(text(
             "SELECT format_type(atttypid, atttypmod) "
             "FROM pg_attribute "
-            "WHERE attrelid = 'chunks'::regclass "
+            "WHERE attrelid = to_regclass('chunks') "
             "  AND attname = 'embedding' "
             "  AND attnum > 0 "
             "  AND NOT attisdropped"
@@ -174,10 +174,10 @@ async def init_db() -> None:
 
         # Add file storage columns to existing documents table (idempotent)
         await conn.execute(text(
-            "ALTER TABLE documents ADD COLUMN IF NOT EXISTS file_key VARCHAR(1024)"
+            "ALTER TABLE IF EXISTS documents ADD COLUMN IF NOT EXISTS file_key VARCHAR(1024)"
         ))
         await conn.execute(text(
-            "ALTER TABLE documents ADD COLUMN IF NOT EXISTS file_url TEXT"
+            "ALTER TABLE IF EXISTS documents ADD COLUMN IF NOT EXISTS file_url TEXT"
         ))
 
         # Create tables / indexes that don't exist yet
