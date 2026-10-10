@@ -2,6 +2,8 @@
 Application settings loaded from environment variables / .env file.
 """
 
+from typing import Literal
+
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -30,10 +32,13 @@ class Settings(BaseSettings):
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     openrouter_model: str = "meta-llama/llama-3.1-8b-instruct:free"
 
-    # Voyage AI embeddings
+    # Embeddings: "local" (free, in-process MiniLM) or "voyage" (API)
+    embedding_provider: Literal["local", "voyage"] = "local"
+    local_embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
     voyage_api_key: str = ""
     voyage_model: str = "voyage-3-lite"
-    embedding_dim: int = 512  # voyage-3-lite=512, voyage-3/voyage-3-large=1024
+    # Must match the provider: local MiniLM=384, voyage-3-lite=512, voyage-3/voyage-3-large=1024
+    embedding_dim: int = 384
 
     # RAG parameters
     top_k: int = 5          # chunks sent to LLM (context window size)

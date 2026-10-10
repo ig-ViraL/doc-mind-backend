@@ -1,10 +1,16 @@
 """
-Voyage AI embedder — API-based, async, singleton.
-Uses input_type="document" for indexing and input_type="query" for retrieval.
+Pluggable async embedder (singleton).
+
+Providers (``EMBEDDING_PROVIDER``):
+  local  — sentence-transformers ``all-MiniLM-L6-v2`` (384 dims). Free, no API key, runs in-process.
+  voyage — Voyage AI API (``voyage-3-lite``, 512 dims). Needs ``VOYAGE_API_KEY``.
+
+``embedding_dim`` in config must match the provider's output size.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Literal
 
@@ -22,7 +28,20 @@ class Embedder:
             cls._instance = super().__new__(cls)
         return cls._instance
 
+    def _get_local_model(self) -> Any:
+        if self._client is None:
+            from sentence_transformers import SentenceTransformer
+            from config import settings
+
+            logger.info("Loading local embedding model: %s", settings.local_embedding_model)
+            self._client = SentenceTransformer(settings.local_embedding_model)
+        return self._client
+
     def _get_client(self) -> Any:
+        from config import settings
+
+        if settings.embedding_provider == "local":
+            return self._get_local_model()
         if self._client is None:
             import voyageai
             from config import settings
@@ -45,6 +64,13 @@ class Embedder:
 
         client = self._get_client()
         from config import settings
+
+        if settings.embedding_provider == "local":
+            # CPU-bound: keep it off the event loop.
+            vectors = await asyncio.to_thread(
+                client.encode, texts, normalize_embeddings=True, batch_size=32
+            )
+            return vectors.tolist()
 
         all_embeddings: list[list[float]] = []
         total_batches = -(-len(texts) // _BATCH_SIZE)  # ceiling division
@@ -71,6 +97,6 @@ embedder = Embedder()
 
 
 def warm_up() -> None:
-    """Pre-initialize the Voyage AI client (validates API key is configured)."""
+    """Pre-initialize the embedding backend so the first request isn't slow."""
     embedder._get_client()
-    logger.info("Voyage AI embedder initialized")
+    logger.info("Embedder initialized")

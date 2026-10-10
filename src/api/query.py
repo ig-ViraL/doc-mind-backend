@@ -11,12 +11,15 @@ from __future__ import annotations
 import logging
 
 import openai
+import json
+
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.database import get_db
 from models.schemas import QueryRequest, QueryResponse
-from services.rag_pipeline import answer_query
+from services.rag_pipeline import answer_query, stream_answer
 
 logger = logging.getLogger(__name__)
 
@@ -74,3 +77,44 @@ async def query_documents(
         )
 
     return response
+
+
+@router.post(
+    "/query/stream",
+    summary="Ask a question and stream the answer (Server-Sent Events)",
+    response_class=StreamingResponse,
+)
+async def query_documents_stream(
+    request: QueryRequest,
+    session: AsyncSession = Depends(get_db),
+) -> StreamingResponse:
+    """
+    Same pipeline as ``POST /query`` but streamed as SSE:
+
+    - ``event: sources`` -> cited chunks (sent first, before generation starts)
+    - ``event: token``   -> incremental answer text
+    - ``event: done``    -> final latency
+    - ``event: error``   -> emitted if the LLM fails mid-stream
+    """
+
+    async def event_source():
+        try:
+            async for event, data in stream_answer(
+                query=request.query,
+                document_ids=request.document_ids,
+                k=request.k,
+                session=session,
+            ):
+                yield f"event: {event}\ndata: {json.dumps(data)}\n\n"
+        except openai.APIError as exc:
+            logger.error("LLM error during stream: %s", exc)
+            yield f"event: error\ndata: {json.dumps({'detail': 'LLM API error'})}\n\n"
+        except Exception:
+            logger.exception("Unexpected error during stream")
+            yield f"event: error\ndata: {json.dumps({'detail': 'Unexpected error'})}\n\n"
+
+    return StreamingResponse(
+        event_source(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )

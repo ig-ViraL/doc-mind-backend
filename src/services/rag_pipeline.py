@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 import re
 import time
-from typing import Any
+from typing import Any, AsyncIterator
 
 import openai
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -158,52 +158,21 @@ never as a person or entity described in the documents.\
 
 
 # ---------------------------------------------------------------------------
-# Main pipeline function
+# Pipeline stages (shared by the blocking and streaming entry points)
 # ---------------------------------------------------------------------------
 
 
-async def answer_query(
+async def _retrieve(
     query: str,
     document_ids: list[str] | None,
     k: int,
     session: AsyncSession,
-) -> QueryResponse:
-    """
-    Run the full RAG pipeline for a user query.
-
-    Args:
-        query:        Natural-language question from the user.
-        document_ids: Optional list of document UUIDs to restrict search.
-        k:            Number of chunks to retrieve.
-        session:      Active async DB session.
-
-    Returns:
-        QueryResponse with answer, cited source chunks, and latency_ms.
-    """
-    start_time = time.perf_counter()
-
-    # ------------------------------------------------------------------
-    # 0. Short-circuit: meta / identity queries never touch retrieval
-    # ------------------------------------------------------------------
-    if _is_meta_query(query):
-        logger.info("Meta query detected — skipping retrieval")
-        return QueryResponse(
-            answer=_DOCMIND_INTRO,
-            sources=[],
-            latency_ms=round((time.perf_counter() - start_time) * 1000, 2),
-        )
-
-    # ------------------------------------------------------------------
-    # 1. Embed the query
-    # ------------------------------------------------------------------
+) -> list[dict[str, Any]]:
+    """Embed -> hybrid search (vector + BM25 via RRF) -> cross-encoder rerank -> top-k."""
     query_vectors = await embedder.embed([query], input_type="query")
     query_embedding: list[float] = query_vectors[0]
-    logger.debug("Query embedded (%d dims)", len(query_embedding))
 
-    # ------------------------------------------------------------------
-    # 2. Hybrid search over a larger candidate pool
-    # ------------------------------------------------------------------
-    # retrieval_k is always >= k so reranking has more to work with.
+    # retrieval_k is always >= k so reranking has more candidates to work with.
     retrieval_k = max(settings.retrieval_k, k)
     raw_chunks = await hybrid_search(
         session=session,
@@ -213,91 +182,138 @@ async def answer_query(
         document_ids=document_ids,
         rrf_k=settings.rrf_k,
     )
-    logger.info(
-        "Retrieved %d candidates (retrieval_k=%d, context_k=%d)",
-        len(raw_chunks), retrieval_k, k,
-    )
-    for c in raw_chunks:
-        logger.debug("  chunk=%d rrf=%.6f file=%s", c["chunk_index"], c["score"], c["filename"])
-
-    # ------------------------------------------------------------------
-    # 3. Cross-encoder reranking over full candidate pool
-    # ------------------------------------------------------------------
     reranked_chunks = _rerank(query, raw_chunks)
-
-    # ------------------------------------------------------------------
-    # 3b. Truncate to context_k — only the top-k go to the LLM
-    # ------------------------------------------------------------------
     ranked_chunks = reranked_chunks[:k]
     logger.info(
-        "Truncated to %d chunks for LLM context (dropped %d after reranking)",
-        len(ranked_chunks), len(reranked_chunks) - len(ranked_chunks),
+        "Retrieved %d candidates, sending top %d to the LLM",
+        len(raw_chunks), len(ranked_chunks),
+    )
+    return ranked_chunks
+
+
+def _build_user_message(query: str, ranked_chunks: list[dict[str, Any]]) -> str:
+    if ranked_chunks:
+        context = "\n\n---\n\n".join(
+            f"[Source: {c['filename']}]\n{c['text']}" for c in ranked_chunks
+        )
+        return f"Document excerpts:\n\n{context}\n\nQuestion: {query}"
+    # No chunks at all: guide the LLM to a useful non-answer instead of hallucinating.
+    logger.warning("No chunks retrieved — asking LLM to respond constructively")
+    return (
+        f"Question: {query}\n\n"
+        "No relevant excerpts were found in the indexed documents for this question. "
+        "Politely explain that the uploaded documents do not contain information relevant "
+        "to this question. Do not offer to answer it yourself, generate content, or help "
+        "in any way that goes beyond the document content."
     )
 
-    # ------------------------------------------------------------------
-    # 4. Build context string
-    # ------------------------------------------------------------------
-    if ranked_chunks:
-        context_parts: list[str] = []
-        for chunk in ranked_chunks:
-            context_parts.append(f"[Source: {chunk['filename']}]\n{chunk['text']}")
-        context = "\n\n---\n\n".join(context_parts)
-        user_message = f"Document excerpts:\n\n{context}\n\nQuestion: {query}"
-    else:
-        # No chunks at all — guide the LLM to produce a useful non-answer
-        # rather than hallucinating or giving a generic refusal.
-        logger.warning("No chunks retrieved — asking LLM to respond constructively")
-        user_message = (
-            f"Question: {query}\n\n"
-            "No relevant excerpts were found in the indexed documents for this question. "
-            "Politely explain that the uploaded documents do not contain information relevant "
-            "to this question. Do not offer to answer it yourself, generate content, or help "
-            "in any way that goes beyond the document content."
+
+def _to_sources(ranked_chunks: list[dict[str, Any]]) -> list[SourceChunk]:
+    return [
+        SourceChunk(
+            chunk_index=c["chunk_index"],
+            text=c["text"],
+            score=c["score"],
+            document_id=c["document_id"],
+            filename=c["filename"],
+        )
+        for c in ranked_chunks
+    ]
+
+
+def _messages(user_message: str) -> list[dict[str, str]]:
+    return [
+        {"role": "system", "content": _SYSTEM_PROMPT},
+        {"role": "user", "content": user_message},
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Blocking entry point
+# ---------------------------------------------------------------------------
+
+
+async def answer_query(
+    query: str,
+    document_ids: list[str] | None,
+    k: int,
+    session: AsyncSession,
+) -> QueryResponse:
+    """Run the full RAG pipeline and return the complete answer with cited sources."""
+    start_time = time.perf_counter()
+
+    if _is_meta_query(query):
+        logger.info("Meta query detected — skipping retrieval")
+        return QueryResponse(
+            answer=_DOCMIND_INTRO,
+            sources=[],
+            latency_ms=round((time.perf_counter() - start_time) * 1000, 2),
         )
 
-    # ------------------------------------------------------------------
-    # 5. Call LLM via OpenRouter
-    # ------------------------------------------------------------------
+    ranked_chunks = await _retrieve(query, document_ids, k, session)
+
     client = get_openrouter_client()
     try:
         response = await client.chat.completions.create(
             model=settings.openrouter_model,
             max_tokens=1024,
-            messages=[
-                {"role": "system", "content": _SYSTEM_PROMPT},
-                {"role": "user", "content": user_message},
-            ],
+            messages=_messages(_build_user_message(query, ranked_chunks)),
         )
         answer: str = response.choices[0].message.content or ""
     except openai.APIError as exc:
         logger.exception("OpenRouter API error: %s", exc)
         raise
 
-    # ------------------------------------------------------------------
-    # 6. Build response
-    # ------------------------------------------------------------------
     latency_ms = (time.perf_counter() - start_time) * 1000
-
-    sources: list[SourceChunk] = [
-        SourceChunk(
-            chunk_index=chunk["chunk_index"],
-            text=chunk["text"],
-            score=chunk["score"],
-            document_id=chunk["document_id"],
-            filename=chunk["filename"],
-        )
-        for chunk in ranked_chunks
-    ]
-
-    logger.info(
-        "answer_query completed: latency=%.1f ms, sources=%d, answer_len=%d",
-        latency_ms,
-        len(sources),
-        len(answer),
-    )
-
+    logger.info("answer_query completed: latency=%.1f ms, sources=%d", latency_ms, len(ranked_chunks))
     return QueryResponse(
         answer=answer,
-        sources=sources,
+        sources=_to_sources(ranked_chunks),
         latency_ms=round(latency_ms, 2),
     )
+
+
+# ---------------------------------------------------------------------------
+# Streaming entry point (Server-Sent Events)
+# ---------------------------------------------------------------------------
+
+
+async def stream_answer(
+    query: str,
+    document_ids: list[str] | None,
+    k: int,
+    session: AsyncSession,
+) -> AsyncIterator[tuple[str, dict[str, Any]]]:
+    """
+    Yield ``(event, data)`` pairs for an SSE response:
+
+      sources -> the cited chunks, sent *before* generation so the UI can render them immediately
+      token   -> incremental answer text
+      done    -> final latency
+    """
+    start_time = time.perf_counter()
+
+    def _latency() -> float:
+        return round((time.perf_counter() - start_time) * 1000, 2)
+
+    if _is_meta_query(query):
+        yield "sources", {"sources": []}
+        yield "token", {"text": _DOCMIND_INTRO}
+        yield "done", {"latency_ms": _latency()}
+        return
+
+    ranked_chunks = await _retrieve(query, document_ids, k, session)
+    yield "sources", {"sources": [s.model_dump() for s in _to_sources(ranked_chunks)]}
+
+    client = get_openrouter_client()
+    stream = await client.chat.completions.create(
+        model=settings.openrouter_model,
+        max_tokens=1024,
+        stream=True,
+        messages=_messages(_build_user_message(query, ranked_chunks)),
+    )
+    async for event in stream:
+        if event.choices and event.choices[0].delta.content:
+            yield "token", {"text": event.choices[0].delta.content}
+
+    yield "done", {"latency_ms": _latency()}
