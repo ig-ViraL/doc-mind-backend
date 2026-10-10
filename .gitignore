@@ -8,3 +8,4 @@ venv/
 .DS_Store
 pgdata/
 viral-agents.md
+.claude/settings.local.json
