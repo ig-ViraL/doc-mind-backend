@@ -11,3 +11,6 @@ viral-agents.md
 .claude/settings.local.json
 .neon
 .env.local
+.claude/skills/
+.mcp.json
+skills-lock.json
