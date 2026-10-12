@@ -1,8 +1,29 @@
-# DocMind
+<div align="center">
 
-A production-ready RAG (Retrieval-Augmented Generation) backend for document Q&A. Upload PDFs, DOCX, or TXT files — DocMind extracts text, tables, images, and hyperlinks, chunks and embeds the content, stores it in PostgreSQL with pgvector, and answers natural-language questions with cited sources.
+# 🧠 DocMind
 
-**Backend only.** Frontend is a separate project.
+**Production RAG backend for document Q&A: hybrid search, cross-encoder reranking, streamed answers with source citations.**
+
+![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white) ![FastAPI](https://img.shields.io/badge/FastAPI-async-009688?logo=fastapi&logoColor=white) ![pgvector](https://img.shields.io/badge/PostgreSQL-pgvector-336791?logo=postgresql&logoColor=white) ![Tests](https://github.com/ig-ViraL/doc-mind-backend/actions/workflows/ci.yml/badge.svg)
+
+</div>
+
+## Highlights
+
+| | |
+|:--|:--|
+| 🔎 **Hybrid retrieval** | pgvector cosine search (IVFFlat) + PostgreSQL full-text (BM25-style), fused with **Reciprocal Rank Fusion** |
+| 🎯 **Reranking** | Candidate pool of 12 reranked by a `ms-marco-MiniLM` **cross-encoder**, top-k sent to the LLM |
+| ⚡ **Streaming** | `POST /api/query/stream` emits `sources`, then `token`s, then `done` over **Server-Sent Events** |
+| 📄 **Rich ingestion** | PDF / DOCX / TXT: text, tables (to Markdown), images (vision LLM) and hyperlinks |
+| 🆓 **Runs free** | Local `all-MiniLM-L6-v2` embeddings by default (no API key), Neon Postgres, OpenRouter free models |
+| ✅ **Tested** | 15 unit tests (retrieval stages, SSE streaming, config) run in CI |
+
+## How it was built
+
+Designed and directed by me; implemented with **Claude Code** as a pair programmer. The architecture decisions, trade-offs and the debugging story are written up in [Challenges & How I Solved Them](#challenges--how-we-solved-them) below.
+
+**Backend only.** The UI lives in my [portfolio](https://www.viral-deshle.cloud/docmind).
 
 ---
 
@@ -129,6 +150,7 @@ A production-ready RAG (Retrieval-Augmented Generation) backend for document Q&A
 | `GET` | `/api/documents/{id}/chunks` | List all chunks for a document |
 | `DELETE` | `/api/documents/{id}` | Delete document and all its chunks |
 | `POST` | `/api/query` | Ask a question, get answer + cited sources |
+| `POST` | `/api/query/stream` | Same pipeline, streamed as SSE (`sources` → `token`… → `done`) |
 | `GET` | `/health` | Liveness check — `{"status": "ok"}` |
 | `GET` | `/api/status` | Uptime, config, and DB connectivity |
 
@@ -223,7 +245,9 @@ Copy `src/.env.example` to `src/.env` and fill in your values.
 | `OPENROUTER_API_KEY` | **Yes** | — | API key from [openrouter.ai/keys](https://openrouter.ai/keys) |
 | `OPENROUTER_MODEL` | No | `anthropic/claude-3.5-sonnet` | Any OpenRouter model slug |
 | `DATABASE_URL` | No | local postgres | asyncpg connection string |
-| `EMBEDDING_MODEL` | No | `all-MiniLM-L6-v2` | Any SentenceTransformers model |
+| `EMBEDDING_PROVIDER` | No | `local` | `local` (free MiniLM, 384 dims) or `voyage` (API) |
+| `EMBEDDING_DIM` | No | `384` | Must match the provider (voyage-3-lite = 512) |
+| `CORS_ORIGINS` | No | `*` | Comma-separated allowed browser origins |
 | `TOP_K` | No | `5` | Chunks sent to LLM per query (1–10) |
 | `RETRIEVAL_K` | No | `12` | Candidate pool for reranking (should be > TOP_K) |
 | `CHUNK_SIZE` | No | `512` | Max characters per chunk |
