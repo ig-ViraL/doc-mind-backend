@@ -1,0 +1,12 @@
+{$DOCMIND_HOST} {
+	encode gzip
+	reverse_proxy docmind:8000 {
+		flush_interval -1   # keep SSE streaming un-buffered
+	}
+}
+
+{$MCP_HOST} {
+	reverse_proxy pg-mcp:8000 {
+		flush_interval -1
+	}
+}

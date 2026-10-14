@@ -1,0 +1,54 @@
+# DocMind + PG-MCP + demo Postgres + Caddy (auto-HTTPS) on one Oracle ARM VM.
+services:
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports: ["80:80", "443:443"]
+    environment:
+      DOCMIND_HOST: ${DOCMIND_HOST}
+      MCP_HOST: ${MCP_HOST}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+    depends_on: [docmind, pg-mcp]
+
+  docmind:
+    build: ./app/doc-mind-backend
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: ${DOCMIND_DATABASE_URL}        # Neon pooled URL (app normalises sslmode)
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-meta-llama/llama-3.1-8b-instruct:free}
+      EMBEDDING_PROVIDER: local
+      EMBEDDING_DIM: "384"
+      EXTRACT_IMAGES: "false"
+      CORS_ORIGINS: https://www.viral-deshle.cloud,https://viral-deshle.cloud
+      PORT: "8000"
+    volumes:
+      - hf_cache:/root/.cache/huggingface   # cache MiniLM + cross-encoder between restarts
+
+  demo-db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${DEMO_DB_ADMIN_PASSWORD}
+      POSTGRES_DB: demo
+    volumes: [demo_pg:/var/lib/postgresql/data]
+
+  pg-mcp:
+    build: ./app/pg-mcp-server
+    restart: unless-stopped
+    depends_on: [demo-db]
+    environment:
+      DATABASE_URL: postgresql://mcp_readonly:${DEMO_DB_READONLY_PASSWORD}@demo-db:5432/demo
+      SHARED_SECRET: ${MCP_SHARED_SECRET}
+      ALLOWED_HOSTS: ${MCP_HOST}
+      ALLOWED_ORIGINS: https://www.viral-deshle.cloud
+      LOG_FORMAT: json
+      PORT: "8000"
+
+volumes:
+  caddy_data:
+  hf_cache:
+  demo_pg:
