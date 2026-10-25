@@ -1,18 +1,25 @@
 """
-RAG pipeline orchestration.
+Query orchestration for all modes.
 
-Flow:
-  1. Embed the query
-  2. Similarity search (top-K chunks)
-  3. Optional cross-encoder reranking
-  4. Build context string
-  5. Call Claude API
-  6. Return QueryResponse with answer, cited sources, latency_ms
+  fast        retrieve top-k -> stream an answer that cites [n] passages
+  deep        bounded tool loop (services.agent.deep) -> answer -> check
+  exhaustive  map-reduce over sections (services.agent.exhaustive) -> answer -> check
+  auto        router picks one of the above
+
+``stream_answer`` yields (event, data) pairs used directly by the SSE endpoint:
+
+  mode       {"mode", "requested", "reason"}
+  step       {"n", "tool", "args", "summary"}             (deep / exhaustive)
+  sources    {"sources": [...]}                            evidence the answer may cite
+  token      {"text"}                                      answer text
+  citations  {"citations": [...], "removed": [...]}        markers used + sentences the checker dropped
+  done       {"latency_ms", "mode", "budget"}
+
+``answer_query`` runs the same generator and collects a QueryResponse.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import re
 import time
@@ -22,12 +29,18 @@ import openai
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import settings
-from models.schemas import QueryResponse, SourceChunk
-from services.embedder import embedder, embedding_text
+from models.schemas import Citation, QueryResponse, SourceChunk, StepEvent
+from services.agent import answer as answer_mod
+from services.agent.deep import run_deep
+from services.agent.exhaustive import run_exhaustive
+from services.agent.router import route
+from services.agent.store import DocStore, PgStore
+from services.agent.workspace import Budget, Passage, Workspace
 from services.llm_client import get_openrouter_client
-from services.vector_store import hybrid_search
 
 logger = logging.getLogger(__name__)
+
+Event = tuple[str, dict[str, Any]]
 
 
 # ---------------------------------------------------------------------------
@@ -55,12 +68,11 @@ _DOCMIND_INTRO = (
     "I answer questions using only the content of documents you upload — "
     "I don't draw on outside knowledge or make things up.\n\n"
     "Here's what I can do:\n"
-    "- Answer questions across one or more uploaded documents\n"
-    "- Reason accurately over tables and structured data\n"
-    "- Understand images and charts via AI-generated descriptions\n"
-    "- Recognise hyperlinks referenced in your documents\n"
-    "- Synthesise information across multiple files\n\n"
-    "Supported formats: PDF, DOCX, TXT.\n\n"
+    "- Answer quick factual questions with page-level citations\n"
+    "- Research harder questions step by step (deep mode)\n"
+    "- Read a whole document to list or summarise everything relevant (exhaustive mode)\n"
+    "- Reason over tables, image descriptions and links in your files\n\n"
+    "Supported formats: PDF, DOCX, TXT, MD.\n\n"
     "Upload a document and ask me anything about its content."
 )
 
@@ -71,176 +83,137 @@ def _is_meta_query(query: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Cross-encoder reranker (lazy-loaded)
-# ---------------------------------------------------------------------------
-
-_cross_encoder: Any | None = None
-
-
-def warm_up_cross_encoder() -> None:
-    """Pre-load the cross-encoder so the first request isn't slow."""
-    _get_cross_encoder()
-
-
-def _get_cross_encoder() -> Any:
-    global _cross_encoder
-    if _cross_encoder is None:
-        try:
-            from sentence_transformers import CrossEncoder
-
-            from services.devices import pick_device, use_fp16
-
-            device = pick_device(settings.reranker_device)
-            logger.info("Loading cross-encoder %s on %s", settings.cross_encoder_model, device)
-            ce = CrossEncoder(
-                settings.cross_encoder_model,
-                device=device,
-                max_length=settings.reranker_max_length,
-            )
-            if use_fp16(device, settings.reranker_fp16):
-                ce.model.half()
-            _cross_encoder = ce
-            logger.info("Cross-encoder model loaded")
-        except Exception as exc:
-            logger.warning("Failed to load cross-encoder (%s) — reranking disabled", exc)
-            _cross_encoder = None
-    return _cross_encoder
-
-
-def _rerank(query: str, chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """
-    Rerank *chunks* using a cross-encoder model.
-    Returns chunks sorted by descending cross-encoder score.
-    If the cross-encoder is unavailable, returns chunks unchanged.
-    """
-    cross_encoder = _get_cross_encoder()
-    if cross_encoder is None or not chunks:
-        return chunks
-
-    try:
-        pairs = [(query, embedding_text(c.get("header"), c["text"])) for c in chunks]
-        scores: list[float] = [
-            float(s)
-            for s in cross_encoder.predict(pairs, batch_size=settings.reranker_batch_size)
-        ]
-        ranked = sorted(zip(scores, chunks), key=lambda x: x[0], reverse=True)
-        reranked = [chunk for _, chunk in ranked]
-        logger.debug("Reranked %d chunks", len(reranked))
-        return reranked
-    except Exception as exc:
-        logger.warning("Cross-encoder reranking failed: %s — using original order", exc)
-        return chunks
-
-
-# ---------------------------------------------------------------------------
-# System prompt
-# ---------------------------------------------------------------------------
-
-_SYSTEM_PROMPT = """\
-You are DocMind, an intelligent assistant that answers questions strictly from the content of uploaded documents.
-
-Each excerpt you receive is labelled with its source file. Excerpts may contain:
-- Plain text passages
-- Tables in Markdown format (rows and columns of data)
-- Image descriptions prefixed with [IMAGE] (treat these as factual observations)
-- Hyperlinks prefixed with [HYPERLINKS]
-
-How to answer:
-- Use only the provided excerpts. Do not use outside knowledge or make up facts.
-- Synthesise across multiple excerpts and sources when the answer spans them.
-- Cite the source file name in parentheses when referencing a specific fact — e.g. (resume.pdf) — not a chunk or page number.
-- When an excerpt contains a table, reason accurately over its values; do not paraphrase incorrectly.
-- When an excerpt describes an image or chart, treat that description as ground truth.
-- Write naturally and directly. Do not start answers with "Based on the context..." or "According to the documents...".
-- Do not expose internal labels like chunk numbers or page numbers unless they are meaningful to the user.
-
-Hard scope limits — never cross these:
-- Do NOT write, generate, or produce any content (code, essays, summaries, plans) that is not directly extracted or paraphrased from the uploaded documents.
-- Do NOT offer to generate something "for the user" as an alternative when the documents lack the answer.
-- Do NOT answer general-knowledge questions, perform calculations, or act as a general-purpose assistant.
-- If the uploaded documents happen to contain code, you may explain or quote that code. You may not write new code.
-
-When the excerpts do not fully cover the question:
-- Answer what you can from what is available.
-- Clearly state that the information is not present in the uploaded documents.
-- If helpful, suggest a more specific question that the documents could plausibly answer — only if such a question exists.
-- Never offer to generate, write, or produce anything as a substitute.
-
-If the user asks who you are or about your capabilities, always identify yourself as DocMind — \
-never as a person or entity described in the documents.\
-"""
-
-
-# ---------------------------------------------------------------------------
-# Pipeline stages (shared by the blocking and streaming entry points)
+# Helpers
 # ---------------------------------------------------------------------------
 
 
-async def _retrieve(
+def _sources(passages: list[Passage]) -> list[dict[str, Any]]:
+    return [
+        SourceChunk(
+            marker=i,
+            chunk_index=p.chunk_index,
+            text=p.text,
+            score=round(p.score, 4),
+            document_id=p.document_id,
+            filename=p.filename,
+            page_start=p.page_start,
+            page_end=p.page_end,
+            section_path=p.section_path,
+            note=p.note,
+        ).model_dump()
+        for i, p in enumerate(passages, start=1)
+    ]
+
+
+def _paragraphs(text: str) -> list[str]:
+    """Emit a checked answer in a few token events (keeps the streaming UI contract)."""
+    parts = re.split(r"(\n\n)", text)
+    return [p for p in parts if p]
+
+
+async def _fast_passages(store: DocStore, query: str, k: int, ws: Workspace) -> list[Passage]:
+    hits = await store.search(query, k)
+    passages = []
+    for h in hits:
+        passages.append(ws.add_passage(
+            document_id=h["document_id"], filename=h["filename"], text=h["text"],
+            page_start=h.get("page_start"), page_end=h.get("page_end"),
+            section_path=h.get("section_path"), chunk_id=h.get("chunk_id"),
+            chunk_index=h.get("chunk_index", -1),
+            score=float(h.get("rerank_score", h.get("score", 0.0)) or 0.0),
+        ))
+    ws.add_evidence([p.id for p in passages])
+    return passages
+
+
+# ---------------------------------------------------------------------------
+# Streaming entry point
+# ---------------------------------------------------------------------------
+
+
+async def stream_answer(
     query: str,
     document_ids: list[str] | None,
     k: int,
     session: AsyncSession,
-) -> list[dict[str, Any]]:
-    """Embed -> hybrid search (vector + BM25 via RRF) -> cross-encoder rerank -> top-k."""
-    query_vectors = await embedder.embed([query], input_type="query")
-    query_embedding: list[float] = query_vectors[0]
+    mode: str = "fast",
+    store: DocStore | None = None,
+) -> AsyncIterator[Event]:
+    start_time = time.perf_counter()
 
-    # retrieval_k is always >= k so reranking has more candidates to work with.
-    retrieval_k = max(settings.retrieval_k, k)
-    raw_chunks = await hybrid_search(
-        session=session,
-        query=query,
-        query_embedding=query_embedding,
-        k=retrieval_k,
-        document_ids=document_ids,
-        rrf_k=settings.rrf_k,
-    )
-    # The cross-encoder is CPU/GPU-bound; run it in a worker thread so other requests keep flowing.
-    reranked_chunks = await asyncio.to_thread(_rerank, query, raw_chunks)
-    ranked_chunks = reranked_chunks[:k]
-    logger.info(
-        "Retrieved %d candidates, sending top %d to the LLM",
-        len(raw_chunks), len(ranked_chunks),
-    )
-    return ranked_chunks
+    def latency() -> float:
+        return round((time.perf_counter() - start_time) * 1000, 2)
 
+    if _is_meta_query(query):
+        yield "mode", {"mode": "fast", "requested": mode, "reason": "question about DocMind"}
+        yield "sources", {"sources": []}
+        yield "token", {"text": _DOCMIND_INTRO}
+        yield "citations", {"citations": [], "removed": []}
+        yield "done", {"latency_ms": latency(), "mode": "fast", "budget": {}}
+        return
 
-def _build_user_message(query: str, ranked_chunks: list[dict[str, Any]]) -> str:
-    if ranked_chunks:
-        context = "\n\n---\n\n".join(
-            f"[Source: {c['filename']}]\n{c['text']}" for c in ranked_chunks
+    store = store or PgStore(session, document_ids)
+    requested = mode
+    reason = "requested"
+    if mode == "auto":
+        mode, reason = await route(query)
+    yield "mode", {"mode": mode, "requested": requested, "reason": reason}
+
+    ws = Workspace()
+    budget = Budget()
+
+    # ---- fast: one retrieval pass, streamed answer -----------------------
+    if mode == "fast":
+        passages = await _fast_passages(store, query, k, ws)
+        yield "sources", {"sources": _sources(passages)}
+        stream = await get_openrouter_client().chat.completions.create(
+            model=settings.openrouter_model,
+            max_tokens=1024,
+            stream=True,
+            messages=answer_mod.build_messages(query, passages),
         )
-        return f"Document excerpts:\n\n{context}\n\nQuestion: {query}"
-    # No chunks at all: guide the LLM to a useful non-answer instead of hallucinating.
-    logger.warning("No chunks retrieved — asking LLM to respond constructively")
-    return (
-        f"Question: {query}\n\n"
-        "No relevant excerpts were found in the indexed documents for this question. "
-        "Politely explain that the uploaded documents do not contain information relevant "
-        "to this question. Do not offer to answer it yourself, generate content, or help "
-        "in any way that goes beyond the document content."
-    )
+        text = ""
+        async for event in stream:
+            if event.choices and event.choices[0].delta.content:
+                piece = event.choices[0].delta.content
+                text += piece
+                yield "token", {"text": piece}
+        yield "citations", {"citations": answer_mod.citations(text, passages), "removed": []}
+        yield "done", {"latency_ms": latency(), "mode": mode, "budget": budget.snapshot()}
+        return
 
+    # ---- deep / exhaustive: research, then answer, then check -------------
+    runner = run_exhaustive if mode == "exhaustive" else run_deep
+    try:
+        async for event in runner(query, store, ws, budget):
+            yield event
+    except openai.BadRequestError as exc:
+        # e.g. the configured model doesn't support tool calls — degrade to fast retrieval.
+        logger.warning("Agent mode %s failed (%s) — falling back to fast retrieval", mode, exc)
+        yield "step", {"n": budget.steps, "tool": "fallback", "args": {}, "summary": "agent unavailable, using fast retrieval"}
+        await _fast_passages(store, query, max(k, 8), ws)
 
-def _to_sources(ranked_chunks: list[dict[str, Any]]) -> list[SourceChunk]:
-    return [
-        SourceChunk(
-            chunk_index=c["chunk_index"],
-            text=c["text"],
-            score=c["score"],
-            document_id=c["document_id"],
-            filename=c["filename"],
-        )
-        for c in ranked_chunks
-    ]
+    if not ws.evidence:
+        await _fast_passages(store, query, k, ws)
 
+    passages = answer_mod.select_evidence(ws.evidence_passages())
+    yield "sources", {"sources": _sources(passages)}
 
-def _messages(user_message: str) -> list[dict[str, str]]:
-    return [
-        {"role": "system", "content": _SYSTEM_PROMPT},
-        {"role": "user", "content": user_message},
-    ]
+    text, used = await answer_mod.generate(query, passages)
+    budget.add_tokens(used)
+    removed: list[str] = []
+    if settings.verify_answers and passages:
+        text, removed, used = await answer_mod.check(text, passages)
+        budget.add_tokens(used)
+        yield "step", {
+            "n": budget.steps, "tool": "check", "args": {},
+            "summary": f"checked answer: removed {len(removed)} unsupported sentence(s)",
+        }
+
+    for piece in _paragraphs(text):
+        yield "token", {"text": piece}
+    yield "citations", {"citations": answer_mod.citations(text, passages), "removed": removed}
+    yield "done", {"latency_ms": latency(), "mode": mode, "budget": budget.snapshot()}
 
 
 # ---------------------------------------------------------------------------
@@ -253,82 +226,44 @@ async def answer_query(
     document_ids: list[str] | None,
     k: int,
     session: AsyncSession,
+    mode: str = "fast",
+    store: DocStore | None = None,
 ) -> QueryResponse:
-    """Run the full RAG pipeline and return the complete answer with cited sources."""
-    start_time = time.perf_counter()
+    text = ""
+    sources: list[dict[str, Any]] = []
+    steps: list[StepEvent] = []
+    cites: list[Citation] = []
+    removed: list[str] = []
+    final: dict[str, Any] = {}
+    mode_info: dict[str, Any] = {}
 
-    if _is_meta_query(query):
-        logger.info("Meta query detected — skipping retrieval")
-        return QueryResponse(
-            answer=_DOCMIND_INTRO,
-            sources=[],
-            latency_ms=round((time.perf_counter() - start_time) * 1000, 2),
-        )
+    async for event, data in stream_answer(query, document_ids, k, session, mode=mode, store=store):
+        if event == "mode":
+            mode_info = data
+        elif event == "step":
+            steps.append(StepEvent(**data))
+        elif event == "sources":
+            sources = data["sources"]
+        elif event == "token":
+            text += data["text"]
+        elif event == "citations":
+            cites = [Citation(**c) for c in data["citations"]]
+            removed = data["removed"]
+        elif event == "done":
+            final = data
 
-    ranked_chunks = await _retrieve(query, document_ids, k, session)
-
-    client = get_openrouter_client()
-    try:
-        response = await client.chat.completions.create(
-            model=settings.openrouter_model,
-            max_tokens=1024,
-            messages=_messages(_build_user_message(query, ranked_chunks)),
-        )
-        answer: str = response.choices[0].message.content or ""
-    except openai.APIError as exc:
-        logger.exception("OpenRouter API error: %s", exc)
-        raise
-
-    latency_ms = (time.perf_counter() - start_time) * 1000
-    logger.info("answer_query completed: latency=%.1f ms, sources=%d", latency_ms, len(ranked_chunks))
+    logger.info(
+        "answer_query: mode=%s latency=%.0fms steps=%d sources=%d",
+        final.get("mode"), final.get("latency_ms", 0), len(steps), len(sources),
+    )
     return QueryResponse(
-        answer=answer,
-        sources=_to_sources(ranked_chunks),
-        latency_ms=round(latency_ms, 2),
+        answer=text,
+        sources=[SourceChunk(**s) for s in sources],
+        latency_ms=final.get("latency_ms", 0.0),
+        mode=final.get("mode", mode_info.get("mode", mode)),
+        mode_reason=mode_info.get("reason"),
+        steps=steps,
+        citations=cites,
+        removed_claims=removed,
+        budget=final.get("budget", {}),
     )
-
-
-# ---------------------------------------------------------------------------
-# Streaming entry point (Server-Sent Events)
-# ---------------------------------------------------------------------------
-
-
-async def stream_answer(
-    query: str,
-    document_ids: list[str] | None,
-    k: int,
-    session: AsyncSession,
-) -> AsyncIterator[tuple[str, dict[str, Any]]]:
-    """
-    Yield ``(event, data)`` pairs for an SSE response:
-
-      sources -> the cited chunks, sent *before* generation so the UI can render them immediately
-      token   -> incremental answer text
-      done    -> final latency
-    """
-    start_time = time.perf_counter()
-
-    def _latency() -> float:
-        return round((time.perf_counter() - start_time) * 1000, 2)
-
-    if _is_meta_query(query):
-        yield "sources", {"sources": []}
-        yield "token", {"text": _DOCMIND_INTRO}
-        yield "done", {"latency_ms": _latency()}
-        return
-
-    ranked_chunks = await _retrieve(query, document_ids, k, session)
-    yield "sources", {"sources": [s.model_dump() for s in _to_sources(ranked_chunks)]}
-
-    client = get_openrouter_client()
-    stream = await client.chat.completions.create(
-        model=settings.openrouter_model,
-        max_tokens=1024,
-        stream=True,
-        messages=_messages(_build_user_message(query, ranked_chunks)),
-    )
-    async for event in stream:
-        if event.choices and event.choices[0].delta.content:
-            yield "token", {"text": event.choices[0].delta.content}
-
-    yield "done", {"latency_ms": _latency()}

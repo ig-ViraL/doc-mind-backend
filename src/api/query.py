@@ -36,16 +36,14 @@ async def query_documents(
     session: AsyncSession = Depends(get_db),
 ) -> QueryResponse:
     """
-    Run the RAG pipeline:
-      1. Embed the query
-      2. Retrieve top-K similar chunks (optionally filtered by document_ids)
-      3. Rerank with cross-encoder
-      4. Generate answer with Claude
-      5. Return answer + cited sources + latency_ms
+    Answer a question. ``mode`` picks the strategy (auto, fast, deep, exhaustive).
+    Returns the answer with [n] citations, the evidence, page-level citations,
+    the agent's steps and the budget it spent.
     """
     logger.info(
-        "Query received: '%s' (k=%d, document_ids=%s)",
+        "Query received: '%s' (mode=%s, k=%d, document_ids=%s)",
         request.query[:80],
+        request.mode,
         request.k,
         request.document_ids,
     )
@@ -56,6 +54,7 @@ async def query_documents(
             document_ids=request.document_ids,
             k=request.k,
             session=session,
+            mode=request.mode,
         )
     except openai.APIStatusError as exc:
         logger.error("OpenRouter API status error: %s", exc)
@@ -91,10 +90,13 @@ async def query_documents_stream(
     """
     Same pipeline as ``POST /query`` but streamed as SSE:
 
-    - ``event: sources`` -> cited chunks (sent first, before generation starts)
-    - ``event: token``   -> incremental answer text
-    - ``event: done``    -> final latency
-    - ``event: error``   -> emitted if the LLM fails mid-stream
+    - ``event: mode``      -> chosen mode and why
+    - ``event: step``      -> one per agent action (deep / exhaustive)
+    - ``event: sources``   -> numbered evidence the answer cites as [n]
+    - ``event: token``     -> answer text
+    - ``event: citations`` -> markers used (with pages) + sentences the checker removed
+    - ``event: done``      -> latency, mode and budget spent
+    - ``event: error``     -> emitted if the LLM fails mid-stream
     """
 
     async def event_source():
@@ -104,6 +106,7 @@ async def query_documents_stream(
                 document_ids=request.document_ids,
                 k=request.k,
                 session=session,
+                mode=request.mode,
             ):
                 yield f"event: {event}\ndata: {json.dumps(data)}\n\n"
         except openai.APIError as exc:

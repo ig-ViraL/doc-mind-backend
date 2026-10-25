@@ -28,7 +28,7 @@ from api.query import router as query_router
 from config import settings
 from db.database import AsyncSessionLocal, init_db
 from services.embedder import warm_up as warm_up_embedder
-from services.rag_pipeline import warm_up_cross_encoder
+from services.retrieval import warm_up_cross_encoder
 
 # ---------------------------------------------------------------------------
 # Logging

@@ -5,6 +5,7 @@ Pydantic v2 request / response models for the DocMind API.
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -110,6 +111,9 @@ class DocumentChunksResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+QueryMode = Literal["auto", "fast", "deep", "exhaustive"]
+
+
 class QueryRequest(BaseModel):
     query: str = Field(..., min_length=1, description="The natural-language question")
     document_ids: list[str] | None = Field(
@@ -120,23 +124,54 @@ class QueryRequest(BaseModel):
         default=5,
         ge=1,
         le=10,
+        description="Passages sent to the LLM in fast mode (reranked from a larger candidate pool).",
+    )
+    mode: QueryMode = Field(
+        default="auto",
         description=(
-            "Number of top-ranked chunks sent to the LLM. "
-            "The pipeline always retrieves a larger candidate pool internally "
-            "and reranks before truncating to this value."
+            "fast: one retrieval pass. deep: bounded tool loop (outline, search, keyword scan, "
+            "read pages/sections). exhaustive: map-reduce over every section. auto: router decides."
         ),
     )
 
 
 class SourceChunk(BaseModel):
-    chunk_index: int
+    marker: int | None = None          # the [n] the answer uses to cite this passage
+    chunk_index: int = -1
     text: str
-    score: float
+    score: float = 0.0
     document_id: str
     filename: str
+    page_start: int | None = None
+    page_end: int | None = None
+    section_path: str | None = None
+    note: str | None = None            # why the agent kept it
+
+
+class Citation(BaseModel):
+    marker: int
+    document_id: str
+    filename: str
+    page_start: int | None = None
+    page_end: int | None = None
+    section_path: str | None = None
+    quote: str
+
+
+class StepEvent(BaseModel):
+    n: int
+    tool: str
+    args: dict[str, Any] = {}
+    summary: str
 
 
 class QueryResponse(BaseModel):
     answer: str
     sources: list[SourceChunk]
     latency_ms: float
+    mode: str = "fast"
+    mode_reason: str | None = None
+    steps: list[StepEvent] = []
+    citations: list[Citation] = []
+    removed_claims: list[str] = []     # sentences the checker removed as unsupported
+    budget: dict[str, Any] = {}

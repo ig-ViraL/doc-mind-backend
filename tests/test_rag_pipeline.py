@@ -4,10 +4,24 @@ from types import SimpleNamespace
 import pytest
 
 from services import rag_pipeline as rp
+from services import retrieval
+from services.agent import answer as answer_mod
+from services.agent.workspace import Passage
 
 
 def _chunk(i, text="alpha", filename="a.pdf"):
-    return {"chunk_index": i, "text": text, "score": 0.5, "document_id": "d1", "filename": filename}
+    return {
+        "chunk_id": f"c{i}", "chunk_index": i, "text": text, "score": 0.5, "document_id": "d1",
+        "filename": filename, "page_start": 3, "page_end": 3, "section_path": "Intro", "header": None,
+    }
+
+
+class OneShotStore:
+    def __init__(self, hits):
+        self.hits = hits
+
+    async def search(self, query, k):
+        return self.hits[:k]
 
 
 @pytest.mark.parametrize("q", ["hi", "Hello!", "who are you?", "what can you do", "Tell me about yourself"])
@@ -20,14 +34,15 @@ def test_document_queries_not_meta(q):
     assert not rp._is_meta_query(q)
 
 
-def test_user_message_includes_sources_and_question():
-    msg = rp._build_user_message("why?", [_chunk(0, "because", "doc.pdf")])
-    assert "[Source: doc.pdf]" in msg and "because" in msg and "Question: why?" in msg
+def test_prompt_numbers_evidence_with_pages_and_sections():
+    p = Passage(id="P1", document_id="d", filename="doc.pdf", text="because", page_start=4, page_end=5, section_path="2 Scope")
+    user = answer_mod.build_messages("why?", [p])[1]["content"]
+    assert "[1] doc.pdf, pp. 4-5, § 2 Scope" in user and "because" in user and "Question: why?" in user
 
 
-def test_user_message_without_chunks_forbids_answering():
-    msg = rp._build_user_message("why?", [])
-    assert "No relevant excerpts" in msg
+def test_prompt_without_evidence_forbids_answering():
+    user = answer_mod.build_messages("why?", [])[1]["content"]
+    assert "No relevant passages" in user
 
 
 def test_rerank_orders_by_score_and_degrades_gracefully(monkeypatch):
@@ -38,28 +53,37 @@ def test_rerank_orders_by_score_and_degrades_gracefully(monkeypatch):
             import numpy as np
             return np.array([0.1 if "low" in p[1] else 0.9 for p in pairs])
 
-    monkeypatch.setattr(rp, "_cross_encoder", FakeCE())
-    assert [c["text"] for c in rp._rerank("q", chunks)] == ["high", "low"]
+    monkeypatch.setattr(retrieval, "_cross_encoder", FakeCE())
+    assert [c["text"] for c in retrieval.rerank("q", chunks)] == ["high", "low"]
 
     class Broken:
         def predict(self, pairs, **kw):
             raise RuntimeError("boom")
 
-    monkeypatch.setattr(rp, "_cross_encoder", Broken())
-    assert rp._rerank("q", chunks) == chunks  # falls back to original order
+    monkeypatch.setattr(retrieval, "_cross_encoder", Broken())
+    assert retrieval.rerank("q", chunks) == chunks  # falls back to original order
+
+
+def test_rerank_uses_section_header(monkeypatch):
+    seen = []
+
+    class FakeCE:
+        def predict(self, pairs, **kw):
+            seen.extend(pairs)
+            return [0.0 for _ in pairs]
+
+    monkeypatch.setattr(retrieval, "_cross_encoder", FakeCE())
+    retrieval.rerank("q", [{**_chunk(0, "body"), "header": "Document: a.pdf\nSection: X"}])
+    assert seen[0][1] == "Document: a.pdf\nSection: X\n\nbody"
 
 
 async def _collect(gen):
     return [item async for item in gen]
 
 
-@pytest.mark.asyncio
-async def test_stream_answer_emits_sources_tokens_done(monkeypatch):
-    async def fake_retrieve(*a, **kw):
-        return [_chunk(0, "ctx")]
-
+async def test_fast_stream_emits_mode_sources_tokens_citations_done(monkeypatch):
     async def fake_stream():
-        for t in ["Hel", "lo"]:
+        for t in ["Hel", "lo [1]"]:
             yield SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content=t))])
 
     async def fake_create(**kw):
@@ -67,22 +91,22 @@ async def test_stream_answer_emits_sources_tokens_done(monkeypatch):
         return fake_stream()
 
     fake_client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=fake_create)))
-    monkeypatch.setattr(rp, "_retrieve", fake_retrieve)
     monkeypatch.setattr(rp, "get_openrouter_client", lambda: fake_client)
 
-    events = await _collect(rp.stream_answer("what is ctx?", None, 5, session=None))
-    names = [e for e, _ in events]
-    assert names == ["sources", "token", "token", "done"]
-    assert events[0][1]["sources"][0]["filename"] == "a.pdf"
-    assert "".join(d["text"] for e, d in events if e == "token") == "Hello"
-    json.dumps(events[-1][1])  # payloads must be JSON-serialisable
+    events = await _collect(rp.stream_answer(
+        "what is ctx?", None, 5, session=None, mode="fast", store=OneShotStore([_chunk(0, "ctx")])
+    ))
+    assert [e for e, _ in events] == ["mode", "sources", "token", "token", "citations", "done"]
+    src = events[1][1]["sources"][0]
+    assert src["filename"] == "a.pdf" and src["page_start"] == 3 and src["marker"] == 1
+    assert "".join(d["text"] for e, d in events if e == "token") == "Hello [1]"
+    cites = events[4][1]["citations"]
+    assert cites[0]["marker"] == 1 and cites[0]["page_start"] == 3
+    for _, data in events:
+        json.dumps(data)  # payloads must be JSON-serialisable
 
 
-@pytest.mark.asyncio
-async def test_stream_answer_meta_query_skips_retrieval(monkeypatch):
-    async def boom(*a, **kw):
-        raise AssertionError("retrieval must not run for meta queries")
-
-    monkeypatch.setattr(rp, "_retrieve", boom)
-    events = await _collect(rp.stream_answer("who are you", None, 5, session=None))
-    assert [e for e, _ in events] == ["sources", "token", "done"]
+async def test_meta_query_skips_retrieval():
+    events = await _collect(rp.stream_answer("who are you?", None, 5, session=None, mode="deep", store=None))
+    assert [e for e, _ in events] == ["mode", "sources", "token", "citations", "done"]
+    assert "DocMind" in events[2][1]["text"]
