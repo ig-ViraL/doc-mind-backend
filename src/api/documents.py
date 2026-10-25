@@ -1,11 +1,13 @@
 """
-Document management endpoints.
+Document management endpoints (mounted at /api).
 
-Routes (mounted at /api by main.py):
-  POST   /documents/upload                    — Upload + index a document
-  GET    /documents                           — List all documents with chunk counts
-  GET    /documents/{document_id}/chunks      — List all chunks for a document
-  DELETE /documents/{document_id}             — Delete document and its chunks
+  POST   /documents/upload                   — store the file, index it in the background (202)
+  GET    /documents                          — list documents with status and chunk counts
+  GET    /documents/{id}/status              — indexing progress (stage, counts, error)
+  GET    /documents/{id}/outline             — section tree with page ranges and summaries
+  GET    /documents/{id}/pages/{page}        — raw text of one page
+  GET    /documents/{id}/chunks              — all chunks
+  DELETE /documents/{id}                     — delete document, pages, sections and chunks
 """
 
 from __future__ import annotations
@@ -21,47 +23,39 @@ from models.schemas import (
     ChunkResponse,
     DocumentChunksResponse,
     DocumentListResponse,
+    DocumentOutlineResponse,
     DocumentResponse,
+    DocumentStatusResponse,
+    PageResponse,
+    SectionOutline,
     UploadResponse,
 )
-from services import chunker as chunker_module
-from services.embedder import embedder
-from services import parser as parser_module
-from services import vector_store
+from services import indexer, vector_store
 from services.storage import r2_storage
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["documents"])
 
-_chunker = chunker_module.TokenChunker(
-    chunk_size=settings.chunk_size,
-    chunk_overlap=settings.chunk_overlap,
-    token_counter=embedder.count_tokens,
-)
 
-
-# ---------------------------------------------------------------------------
-# POST /documents/upload
-# ---------------------------------------------------------------------------
+def _not_found(document_id: str) -> HTTPException:
+    return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Document '{document_id}' not found.")
 
 
 @router.post(
     "/documents/upload",
     response_model=UploadResponse,
-    status_code=status.HTTP_201_CREATED,
-    summary="Upload and index a document",
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Upload a document and index it in the background",
 )
 async def upload_document(
-    file: UploadFile = File(..., description="PDF, DOCX, or TXT file to index"),
+    file: UploadFile = File(..., description="PDF, DOCX, TXT or MD file to index"),
     session: AsyncSession = Depends(get_db),
 ) -> UploadResponse:
     """
-    Parse the uploaded file, chunk it, embed each chunk, and store everything
-    in the database. Returns the new document ID and indexing statistics.
+    Stores the file and returns immediately with ``status="processing"``.
+    Poll ``GET /api/documents/{id}/status`` until it is ``ready`` (or ``failed``).
     """
-    logger.info("Upload request: filename='%s' content_type='%s'", file.filename, file.content_type)
-
     from db import database
 
     if database.embedding_dim_mismatch:
@@ -72,107 +66,91 @@ async def upload_document(
             "Run `python scripts/reindex.py` first.",
         )
 
-    # 1. Read bytes upfront (needed for R2 upload; seek back so parser can read normally)
-    file_bytes = await file.read()
-    await file.seek(0)
-
-    # 2. Parse
-    try:
-        parsed = await parser_module.parse(file)
-    except ValueError as exc:
-        logger.warning("Parse error for '%s': %s", file.filename, exc)
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
-
-    text: str = parsed["text"]
-    metadata: dict = parsed["metadata"]
-
-    if not text.strip():
+    filename = file.filename or "unknown"
+    raw_bytes = await file.read()
+    if not raw_bytes:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Empty file.")
+    if len(raw_bytes) > settings.max_file_size_mb * 1024 * 1024:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Uploaded file contains no extractable text.",
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"File exceeds the {settings.max_file_size_mb} MB limit.",
         )
 
-    # 3. Upload original file to Cloudflare R2 (best-effort — indexing continues on failure)
     file_key: str | None = None
     file_url: str | None = None
     if r2_storage.is_enabled():
         try:
             file_key, file_url = await r2_storage.upload_file(
-                content=file_bytes,
-                filename=metadata["filename"],
+                content=raw_bytes, filename=filename,
                 mime_type=file.content_type or "application/octet-stream",
             )
         except Exception as exc:
             logger.warning("R2 upload failed (non-fatal): %s", exc)
 
-    # 4. Save document metadata
     doc = await vector_store.save_document(
         session=session,
-        filename=metadata["filename"],
-        file_type=metadata["file_type"],
-        page_count=metadata["page_count"],
+        filename=filename,
+        file_type=filename.rsplit(".", 1)[-1].lower() if "." in filename else "unknown",
+        page_count=0,
         file_key=file_key,
         file_url=file_url,
+        status="processing",
+        stage="queued",
     )
-
-    # 5. Chunk
-    chunks = _chunker.chunk(text=text, document_id=doc.id)
-    if not chunks:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Document produced zero chunks after splitting.",
-        )
-
-    # 6. Embed (batch)
-    texts_to_embed = [c["text"] for c in chunks]
-    embeddings = await embedder.embed(texts_to_embed)
-
-    # 7. Store chunks + embeddings
-    chunk_count = await vector_store.save_chunks(
-        session=session,
-        chunks=chunks,
-        embeddings=embeddings,
-        document_id=doc.id,
-    )
-
-    logger.info(
-        "Document indexed: id=%s filename='%s' chunks=%d r2=%s",
-        doc.id, doc.filename, chunk_count, file_key or "none",
-    )
+    # Commit now so the background task (own session) sees the row.
+    await session.commit()
+    indexer.schedule(doc.id, raw_bytes, filename, file.content_type or "")
 
     return UploadResponse(
-        document_id=doc.id,
-        filename=doc.filename,
-        chunk_count=chunk_count,
-        status="indexed",
-        file_key=file_key,
-        file_url=file_url,
+        document_id=doc.id, filename=doc.filename, chunk_count=0, status="processing",
+        file_key=file_key, file_url=file_url,
     )
 
 
-# ---------------------------------------------------------------------------
-# GET /documents
-# ---------------------------------------------------------------------------
+@router.get("/documents", response_model=DocumentListResponse, summary="List all documents")
+async def list_documents(session: AsyncSession = Depends(get_db)) -> DocumentListResponse:
+    docs = await vector_store.get_all_documents(session)
+    return DocumentListResponse(documents=[DocumentResponse(**d) for d in docs])
 
 
 @router.get(
-    "/documents",
-    response_model=DocumentListResponse,
-    summary="List all indexed documents",
+    "/documents/{document_id}/status",
+    response_model=DocumentStatusResponse,
+    summary="Indexing progress for a document",
 )
-async def list_documents(
-    session: AsyncSession = Depends(get_db),
-) -> DocumentListResponse:
-    """Return all documents with their chunk counts, newest first."""
-    docs = await vector_store.get_all_documents(session)
-    return DocumentListResponse(
-        documents=[DocumentResponse(**d) for d in docs]
+async def document_status(document_id: str, session: AsyncSession = Depends(get_db)) -> DocumentStatusResponse:
+    info = await vector_store.get_document_status(session, document_id)
+    if info is None:
+        raise _not_found(document_id)
+    return DocumentStatusResponse(**info)
+
+
+@router.get(
+    "/documents/{document_id}/outline",
+    response_model=DocumentOutlineResponse,
+    summary="Section tree with page ranges and summaries",
+)
+async def document_outline(document_id: str, session: AsyncSession = Depends(get_db)) -> DocumentOutlineResponse:
+    info = await vector_store.get_document_status(session, document_id)
+    if info is None:
+        raise _not_found(document_id)
+    outline = await vector_store.get_outline(session, document_id)
+    return DocumentOutlineResponse(
+        document_id=document_id, filename=info["filename"], summary=info["summary"],
+        sections=[SectionOutline(**s) for s in outline],
     )
 
 
-# ---------------------------------------------------------------------------
-# GET /documents/{document_id}/chunks
-# ---------------------------------------------------------------------------
+@router.get(
+    "/documents/{document_id}/pages/{page}",
+    response_model=PageResponse,
+    summary="Text of one page",
+)
+async def document_page(document_id: str, page: int, session: AsyncSession = Depends(get_db)) -> PageResponse:
+    pages = await vector_store.read_pages(session, document_id, page, page)
+    if not pages:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Page not found.")
+    return PageResponse(document_id=document_id, page=page, text=pages[0]["text"])
 
 
 @router.get(
@@ -180,54 +158,26 @@ async def list_documents(
     response_model=DocumentChunksResponse,
     summary="List all chunks for a document",
 )
-async def get_document_chunks(
-    document_id: str,
-    session: AsyncSession = Depends(get_db),
-) -> DocumentChunksResponse:
-    """Return every chunk stored for the given document, ordered by chunk_index."""
+async def get_document_chunks(document_id: str, session: AsyncSession = Depends(get_db)) -> DocumentChunksResponse:
     filename, chunks = await vector_store.get_document_chunks(session, document_id)
     if filename is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Document '{document_id}' not found.",
-        )
+        raise _not_found(document_id)
     return DocumentChunksResponse(
-        document_id=document_id,
-        filename=filename,
-        chunks=[ChunkResponse(**c) for c in chunks],
+        document_id=document_id, filename=filename, chunks=[ChunkResponse(**c) for c in chunks]
     )
-
-
-# ---------------------------------------------------------------------------
-# DELETE /documents/{document_id}
-# ---------------------------------------------------------------------------
 
 
 @router.delete(
     "/documents/{document_id}",
     status_code=status.HTTP_204_NO_CONTENT,
-    summary="Delete a document and all its chunks",
+    summary="Delete a document and everything derived from it",
 )
-async def delete_document(
-    document_id: str,
-    session: AsyncSession = Depends(get_db),
-) -> None:
-    """
-    Permanently delete the document and all associated chunks.
-    Returns 204 on success, 404 if the document does not exist.
-    """
+async def delete_document(document_id: str, session: AsyncSession = Depends(get_db)) -> None:
     doc = await vector_store.delete_document(session, document_id)
     if not doc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Document '{document_id}' not found.",
-        )
-
-    # Delete original file from R2 (best-effort)
+        raise _not_found(document_id)
     if doc.file_key and r2_storage.is_enabled():
         try:
             await r2_storage.delete_file(doc.file_key)
         except Exception as exc:
             logger.warning("R2 delete failed for key %s: %s", doc.file_key, exc)
-
-    logger.info("Deleted document id=%s", document_id)

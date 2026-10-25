@@ -80,6 +80,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     _start_time = time.time()
     logger.info("DocMind API starting up — initialising database …")
     await init_db()
+    from services.vector_store import fail_interrupted
+
+    async with AsyncSessionLocal() as session:
+        if n := await fail_interrupted(session):
+            logger.warning("Marked %d interrupted indexing job(s) as failed", n)
+        await session.commit()
     logger.info("Database ready — pre-warming ML models …")
     # Both models do blocking file I/O on load; run in thread to keep loop responsive.
     await asyncio.gather(

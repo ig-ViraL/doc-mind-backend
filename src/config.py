@@ -45,7 +45,27 @@ class Settings(BaseSettings):
     # OpenRouter
     openrouter_api_key: str = ""
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
-    openrouter_model: str = "meta-llama/llama-3.1-8b-instruct:free"
+    # Strong model: agent planning, routing fallbacks and final answers.
+    openrouter_model: str = "anthropic/claude-sonnet-4.5"
+    # Cheap model: section/document summaries, map step, answer checking, routing.
+    fast_model: str = "anthropic/claude-haiku-4.5"
+
+    # Agent budgets (deep and exhaustive modes)
+    agent_max_steps: int = 8
+    agent_token_budget: int = 120_000     # prompt + completion tokens across all LLM calls
+    agent_time_limit_s: float = 120.0
+    exhaustive_max_units: int = 48        # sections read in the map step
+    exhaustive_unit_tokens: int = 3_000   # target size of one map unit
+    map_concurrency: int = 6
+    verify_answers: bool = True           # run the checker in deep/exhaustive modes
+
+    # Indexing
+    summarize_sections: bool = True
+    max_section_summaries: int = 150
+    summary_concurrency: int = 6
+    max_vision_images: int = 20           # per document
+    vision_concurrency: int = 4
+    max_concurrent_indexing: int = 1      # documents indexed at once (GPU contention)
 
     # Embeddings: "local" (free, in-process) or "voyage" (API)
     embedding_provider: Literal["local", "voyage"] = "local"

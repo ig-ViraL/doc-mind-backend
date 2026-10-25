@@ -23,8 +23,50 @@ class DocumentResponse(BaseModel):
     chunk_count: int | None = None
     file_key: str | None = None
     file_url: str | None = None
+    status: str = "ready"
+    stage: str | None = None
+    error: str | None = None
+    summary: str | None = None
 
     model_config = {"from_attributes": True}
+
+
+class DocumentStatusResponse(BaseModel):
+    document_id: str
+    filename: str
+    status: str            # processing | ready | failed
+    stage: str | None      # queued | parsing | structuring | embedding | summarizing
+    error: str | None = None
+    page_count: int
+    section_count: int
+    chunk_count: int
+    summary: str | None = None
+
+
+class SectionOutline(BaseModel):
+    section_id: str
+    parent_id: str | None
+    ordinal: int
+    level: int
+    title: str
+    path: str
+    page_start: int
+    page_end: int
+    summary: str | None = None
+    body_chars: int = 0
+
+
+class DocumentOutlineResponse(BaseModel):
+    document_id: str
+    filename: str
+    summary: str | None = None
+    sections: list[SectionOutline]
+
+
+class PageResponse(BaseModel):
+    document_id: str
+    page: int
+    text: str
 
 
 class DocumentListResponse(BaseModel):
@@ -35,7 +77,7 @@ class UploadResponse(BaseModel):
     document_id: str
     filename: str
     chunk_count: int
-    status: str = "indexed"
+    status: str = "processing"
     file_key: str | None = None
     file_url: str | None = None
 
@@ -50,6 +92,9 @@ class ChunkResponse(BaseModel):
     text: str
     start_char: int
     end_char: int
+    page_start: int | None = None
+    page_end: int | None = None
+    section_path: str | None = None
 
     model_config = {"from_attributes": True}
 

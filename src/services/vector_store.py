@@ -1,25 +1,56 @@
 """
-Async pgvector CRUD operations and similarity search.
+Async Postgres/pgvector access: documents, pages, sections, chunks, and search.
 
-All functions accept an AsyncSession and perform fully async DB operations.
+All functions take an AsyncSession and never commit; the caller owns the transaction.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 from typing import Any
 
-from sqlalchemy import String, bindparam, func, literal_column, select, text
+from sqlalchemy import String, bindparam, delete, func, literal_column, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from db.database import Chunk, Document
+from db.database import Chunk, Document, Page, Section
 
 logger = logging.getLogger(__name__)
 
+# Columns every search hit carries (so the agent can cite pages and sections).
+_HIT_COLUMNS = (
+    Chunk.id.label("chunk_id"),
+    Chunk.chunk_index,
+    Chunk.text,
+    Chunk.header,
+    Chunk.section_id,
+    Chunk.section_path,
+    Chunk.page_start,
+    Chunk.page_end,
+    Chunk.document_id,
+    Document.filename,
+)
+
+
+def _hit(row: Any, **extra: Any) -> dict[str, Any]:
+    return {
+        "chunk_id": str(row.chunk_id),
+        "chunk_index": row.chunk_index,
+        "text": row.text,
+        "header": row.header,
+        "section_id": str(row.section_id) if row.section_id else None,
+        "section_path": row.section_path,
+        "page_start": row.page_start,
+        "page_end": row.page_end,
+        "document_id": str(row.document_id),
+        "filename": row.filename,
+        **extra,
+    }
+
 
 # ---------------------------------------------------------------------------
-# Write operations
+# Writes
 # ---------------------------------------------------------------------------
 
 
@@ -30,10 +61,9 @@ async def save_document(
     page_count: int,
     file_key: str | None = None,
     file_url: str | None = None,
+    status: str = "ready",
+    stage: str | None = None,
 ) -> Document:
-    """
-    Insert a new Document row and return the ORM object.
-    """
     doc = Document(
         id=str(uuid.uuid4()),
         filename=filename,
@@ -41,11 +71,58 @@ async def save_document(
         page_count=page_count,
         file_key=file_key,
         file_url=file_url,
+        status=status,
+        stage=stage,
     )
     session.add(doc)
-    await session.flush()  # Populate server-side defaults (uploaded_at)
+    await session.flush()
     logger.info("Saved document id=%s filename='%s'", doc.id, doc.filename)
     return doc
+
+
+async def update_document(session: AsyncSession, document_id: str, **values: Any) -> None:
+    await session.execute(update(Document).where(Document.id == document_id).values(**values))
+
+
+async def save_pages(session: AsyncSession, document_id: str, pages: list[str]) -> None:
+    await session.execute(delete(Page).where(Page.document_id == document_id))
+    session.add_all(
+        Page(id=str(uuid.uuid4()), document_id=document_id, page_number=i, text=t)
+        for i, t in enumerate(pages, start=1)
+    )
+    await session.flush()
+
+
+async def save_sections(
+    session: AsyncSession,
+    document_id: str,
+    sections: list[dict[str, Any]],
+) -> dict[int, str]:
+    """Insert sections (dicts with ordinal/parent ordinal/...) and return {ordinal: id}."""
+    ids = {s["ordinal"]: str(uuid.uuid4()) for s in sections}
+    # Parents always precede children in document order, so one ordered insert is FK-safe.
+    for s in sorted(sections, key=lambda x: x["ordinal"]):
+        session.add(Section(
+            id=ids[s["ordinal"]],
+            document_id=document_id,
+            parent_id=ids.get(s["parent"]) if s["parent"] is not None else None,
+            ordinal=s["ordinal"],
+            level=s["level"],
+            title=s["title"],
+            path=s["path"],
+            page_start=s["page_start"],
+            page_end=s["page_end"],
+            body=s["body"],
+            summary=s.get("summary") or None,
+        ))
+        await session.flush()
+    return ids
+
+
+async def set_section_summaries(session: AsyncSession, summaries: dict[str, str]) -> None:
+    for section_id, summary in summaries.items():
+        if summary:
+            await session.execute(update(Section).where(Section.id == section_id).values(summary=summary))
 
 
 async def save_chunks(
@@ -54,45 +131,33 @@ async def save_chunks(
     embeddings: list[list[float]],
     document_id: str,
 ) -> int:
-    """
-    Bulk-insert Chunk rows with their embeddings.
-
-    Args:
-        session:      Active async DB session.
-        chunks:       List of chunk dicts from the chunker
-                      (keys: text, chunk_index, start_char, end_char, document_id).
-        embeddings:   Parallel list of embedding vectors (one per chunk).
-        document_id:  Parent document UUID string.
-
-    Returns:
-        Number of chunks inserted.
-    """
     if len(chunks) != len(embeddings):
-        raise ValueError(
-            f"Mismatch: {len(chunks)} chunks vs {len(embeddings)} embeddings"
-        )
+        raise ValueError(f"Mismatch: {len(chunks)} chunks vs {len(embeddings)} embeddings")
 
-    chunk_objects: list[Chunk] = []
-    for chunk_dict, embedding in zip(chunks, embeddings):
-        chunk_obj = Chunk(
+    session.add_all(
+        Chunk(
             id=str(uuid.uuid4()),
             document_id=document_id,
-            chunk_index=chunk_dict["chunk_index"],
-            text=chunk_dict["text"],
-            embedding=embedding,
-            start_char=chunk_dict.get("start_char", 0),
-            end_char=chunk_dict.get("end_char", 0),
+            chunk_index=c["chunk_index"],
+            text=c["text"],
+            embedding=emb,
+            start_char=c.get("start_char", 0),
+            end_char=c.get("end_char", 0),
+            page_start=c.get("page_start"),
+            page_end=c.get("page_end"),
+            section_id=c.get("section_id"),
+            section_path=c.get("section_path"),
+            header=c.get("header"),
         )
-        chunk_objects.append(chunk_obj)
-
-    session.add_all(chunk_objects)
+        for c, emb in zip(chunks, embeddings)
+    )
     await session.flush()
-    logger.info("Saved %d chunks for document_id=%s", len(chunk_objects), document_id)
-    return len(chunk_objects)
+    logger.info("Saved %d chunks for document_id=%s", len(chunks), document_id)
+    return len(chunks)
 
 
 # ---------------------------------------------------------------------------
-# Read operations
+# Search
 # ---------------------------------------------------------------------------
 
 
@@ -102,173 +167,26 @@ async def similarity_search(
     k: int = 5,
     document_ids: list[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """
-    Find the *k* most similar chunks to *query_embedding* using cosine distance.
-
-    Optionally filters to a subset of documents via *document_ids*.
-
-    Returns a list of dicts with keys:
-        chunk_index, text, similarity, document_id, filename
-    """
+    """Top-k chunks by cosine similarity (HNSW)."""
     from config import settings
 
-    # cosine distance: 0 = identical, 2 = opposite; similarity = 1 - distance
-    distance_expr = Chunk.embedding.cosine_distance(query_embedding)
-
+    distance = Chunk.embedding.cosine_distance(query_embedding)
     # HNSW only returns ef_search candidates; keep it above the requested k.
     ef_search = max(int(settings.hnsw_ef_search), k)
     await session.execute(text(f"SET LOCAL hnsw.ef_search = {ef_search}"))
 
     stmt = (
-        select(
-            Chunk.chunk_index,
-            Chunk.text,
-            Chunk.document_id,
-            Chunk.id.label("chunk_id"),
-            Document.filename,
-            (1 - distance_expr).label("similarity"),
-        )
+        select(*_HIT_COLUMNS, (1 - distance).label("similarity"))
         .join(Document, Chunk.document_id == Document.id)
         .where(Chunk.embedding.isnot(None))
-        .order_by(distance_expr)
+        .order_by(distance)
         .limit(k)
     )
-
     if document_ids:
         stmt = stmt.where(Chunk.document_id.in_(document_ids))
 
-    result = await session.execute(stmt)
-    rows = result.fetchall()
-
-    hits: list[dict[str, Any]] = []
-    for row in rows:
-        hits.append(
-            {
-                "chunk_index": row.chunk_index,
-                "text": row.text,
-                "similarity": float(row.similarity),
-                "document_id": row.document_id,
-                "filename": row.filename,
-            }
-        )
-
-    logger.debug("similarity_search returned %d results for k=%d", len(hits), k)
-    return hits
-
-
-async def get_all_documents(session: AsyncSession) -> list[dict[str, Any]]:
-    """
-    Return all documents with their chunk counts.
-    """
-    stmt = (
-        select(
-            Document.id,
-            Document.filename,
-            Document.file_type,
-            Document.page_count,
-            Document.uploaded_at,
-            Document.file_key,
-            Document.file_url,
-            func.count(Chunk.id).label("chunk_count"),
-        )
-        .outerjoin(Chunk, Chunk.document_id == Document.id)
-        .group_by(Document.id)
-        .order_by(Document.uploaded_at.desc())
-    )
-
-    result = await session.execute(stmt)
-    rows = result.fetchall()
-
-    docs: list[dict[str, Any]] = []
-    for row in rows:
-        docs.append(
-            {
-                "id": row.id,
-                "filename": row.filename,
-                "file_type": row.file_type,
-                "page_count": row.page_count,
-                "uploaded_at": row.uploaded_at,
-                "file_key": row.file_key,
-                "file_url": row.file_url,
-                "chunk_count": row.chunk_count,
-            }
-        )
-
-    logger.debug("get_all_documents returned %d documents", len(docs))
-    return docs
-
-
-async def get_document_chunks(
-    session: AsyncSession,
-    document_id: str,
-) -> tuple[str | None, list[dict[str, Any]]]:
-    """
-    Return (filename, chunks) for the given document, ordered by chunk_index.
-    Returns (None, []) if the document does not exist.
-    """
-    stmt = (
-        select(
-            Document.filename,
-            Chunk.chunk_index,
-            Chunk.text,
-            Chunk.start_char,
-            Chunk.end_char,
-        )
-        .join(Chunk, Chunk.document_id == Document.id)
-        .where(Document.id == document_id)
-        .order_by(Chunk.chunk_index)
-    )
-
-    result = await session.execute(stmt)
-    rows = result.fetchall()
-
-    if not rows:
-        # Distinguish "doc exists, zero chunks" from "doc not found"
-        doc_stmt = select(Document.filename).where(Document.id == document_id)
-        doc_result = await session.execute(doc_stmt)
-        doc_row = doc_result.scalar_one_or_none()
-        if doc_row is None:
-            return None, []
-        return doc_row, []
-
-    filename = rows[0].filename
-    chunks = [
-        {
-            "chunk_index": row.chunk_index,
-            "text": row.text,
-            "start_char": row.start_char,
-            "end_char": row.end_char,
-        }
-        for row in rows
-    ]
-    logger.debug("get_document_chunks: doc=%s chunks=%d", document_id, len(chunks))
-    return filename, chunks
-
-
-async def delete_document(session: AsyncSession, document_id: str) -> Document | None:
-    """
-    Delete a document and all its chunks (cascaded by FK constraint).
-
-    Returns the deleted Document so callers can access its file_key before it's gone.
-    Returns None if the document did not exist.
-    """
-    stmt = select(Document).where(Document.id == document_id)
-    result = await session.execute(stmt)
-    doc = result.scalar_one_or_none()
-
-    if doc is None:
-        logger.warning("delete_document: document_id=%s not found", document_id)
-        return None
-
-    await session.delete(doc)
-    await session.flush()
-    logger.info("Deleted document id=%s and its chunks", document_id)
-    return doc
-
-
-# ---------------------------------------------------------------------------
-# Lexical search (PostgreSQL full-text search)
-# ---------------------------------------------------------------------------
+    rows = (await session.execute(stmt)).fetchall()
+    return [_hit(r, similarity=float(r.similarity)) for r in rows]
 
 
 async def lexical_search(
@@ -277,70 +195,30 @@ async def lexical_search(
     k: int = 5,
     document_ids: list[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """
-    Full-text search using PostgreSQL's tsvector/tsquery machinery.
-
-    Uses websearch_to_tsquery so the caller can pass raw user input safely
-    (it tolerates unbalanced quotes, stopword-only queries, etc.).
-    Ranks results with ts_rank_cd (cover-density ranking).
-
-    Returns a list of dicts with keys:
-        chunk_index, text, fts_rank, document_id, filename
-    Returns an empty list when no FTS matches exist.
-    """
-    # 'english' is a hardcoded regconfig literal — not user input.
+    """Postgres full-text search (websearch_to_tsquery + ts_rank_cd)."""
     lang = literal_column("'english'")
-    fts_query_param = bindparam("fts_query", value=query, type_=String)
-
     tsvec = func.to_tsvector(lang, Chunk.text)
-    tsquery = func.websearch_to_tsquery(lang, fts_query_param)
-
+    tsquery = func.websearch_to_tsquery(lang, bindparam("fts_query", value=query, type_=String))
     rank_col = func.ts_rank_cd(tsvec, tsquery).label("fts_rank")
-    match_cond = tsvec.op("@@")(tsquery)
 
     stmt = (
-        select(
-            Chunk.chunk_index,
-            Chunk.text,
-            Chunk.document_id,
-            Document.filename,
-            rank_col,
-        )
+        select(*_HIT_COLUMNS, rank_col)
         .join(Document, Chunk.document_id == Document.id)
-        .where(match_cond)
+        .where(tsvec.op("@@")(tsquery))
         .order_by(rank_col.desc())
         .limit(k)
     )
-
     if document_ids:
         stmt = stmt.where(Chunk.document_id.in_(document_ids))
 
     try:
-        result = await session.execute(stmt)
-        rows = result.fetchall()
+        # Savepoint: a bad tsquery must not abort the caller's transaction.
+        async with session.begin_nested():
+            rows = (await session.execute(stmt)).fetchall()
     except Exception as exc:
         logger.warning("lexical_search failed (%s) — returning empty result", exc)
         return []
-
-    hits: list[dict[str, Any]] = []
-    for row in rows:
-        hits.append(
-            {
-                "chunk_index": row.chunk_index,
-                "text": row.text,
-                "fts_rank": float(row.fts_rank),
-                "document_id": row.document_id,
-                "filename": row.filename,
-            }
-        )
-
-    logger.debug("lexical_search returned %d results for k=%d", len(hits), k)
-    return hits
-
-
-# ---------------------------------------------------------------------------
-# Hybrid search — vector + lexical via Reciprocal Rank Fusion
-# ---------------------------------------------------------------------------
+    return [_hit(r, fts_rank=float(r.fts_rank)) for r in rows]
 
 
 async def hybrid_search(
@@ -351,65 +229,229 @@ async def hybrid_search(
     document_ids: list[str] | None = None,
     rrf_k: int = 60,
 ) -> list[dict[str, Any]]:
-    """
-    Retrieve chunks by combining vector similarity and full-text search
-    using Reciprocal Rank Fusion (RRF).
+    """Vector + full-text search fused with Reciprocal Rank Fusion: score = Σ 1/(rrf_k + rank + 1)."""
+    fetch_k = min(k * 2, 200)
+    vector_hits = await similarity_search(session, query_embedding, k=fetch_k, document_ids=document_ids)
+    lexical_hits = await lexical_search(session, query, k=fetch_k, document_ids=document_ids)
 
-    Each retrieval arm produces a ranked list; the RRF score for a chunk at
-    rank r (0-indexed) is  1 / (rrf_k + r + 1).  Scores from both arms are
-    summed, then the top-k results are returned.
-
-    Args:
-        query:           Raw natural-language query (used for FTS).
-        query_embedding: 384-dim embedding vector (used for ANN search).
-        k:               Final number of chunks to return.
-        document_ids:    Optional document filter.
-        rrf_k:           RRF smoothing constant (default 60).
-
-    Returns a list of dicts (same shape as similarity_search) with
-    ``similarity`` set to the fused RRF score.
-    """
-    fetch_k = min(k * 2, 200)  # over-fetch so fusion has enough candidates
-
-    vector_hits = await similarity_search(
-        session, query_embedding, k=fetch_k, document_ids=document_ids
-    )
-    lexical_hits = await lexical_search(
-        session, query, k=fetch_k, document_ids=document_ids
-    )
-
-    logger.debug(
-        "hybrid_search: vector=%d hits, lexical=%d hits",
-        len(vector_hits),
-        len(lexical_hits),
-    )
-
-    # RRF: accumulate 1/(rrf_k + rank + 1) from each arm
     scores: dict[str, float] = {}
-    chunk_data: dict[str, dict[str, Any]] = {}
+    data: dict[str, dict[str, Any]] = {}
+    for hits in (vector_hits, lexical_hits):
+        for rank, hit in enumerate(hits):
+            key = hit["chunk_id"]
+            scores[key] = scores.get(key, 0.0) + 1.0 / (rrf_k + rank + 1)
+            data.setdefault(key, hit)
 
-    for rank, chunk in enumerate(vector_hits):
-        key = f"{chunk['document_id']}:{chunk['chunk_index']}"
-        scores[key] = scores.get(key, 0.0) + 1.0 / (rrf_k + rank + 1)
-        chunk_data[key] = chunk  # prefer vector hit data (has raw similarity)
-
-    for rank, chunk in enumerate(lexical_hits):
-        key = f"{chunk['document_id']}:{chunk['chunk_index']}"
-        scores[key] = scores.get(key, 0.0) + 1.0 / (rrf_k + rank + 1)
-        if key not in chunk_data:
-            chunk_data[key] = chunk
-
-    top_keys = sorted(scores, key=lambda ck: scores[ck], reverse=True)[:k]
-
-    fused: list[dict[str, Any]] = []
-    for key in top_keys:
-        entry = {**chunk_data[key], "score": round(scores[key], 6)}
-        fused.append(entry)
-
+    top = sorted(scores, key=scores.__getitem__, reverse=True)[:k]
     logger.info(
-        "hybrid_search returning %d fused chunks (vector=%d, lexical=%d)",
-        len(fused),
-        len(vector_hits),
-        len(lexical_hits),
+        "hybrid_search: %d fused (vector=%d, lexical=%d)", len(top), len(vector_hits), len(lexical_hits)
     )
-    return fused
+    return [{**data[key], "score": round(scores[key], 6)} for key in top]
+
+
+# ---------------------------------------------------------------------------
+# Structure reads (used by the agent tools and the API)
+# ---------------------------------------------------------------------------
+
+
+async def get_documents_brief(
+    session: AsyncSession, document_ids: list[str] | None = None
+) -> list[dict[str, Any]]:
+    stmt = select(
+        Document.id, Document.filename, Document.page_count, Document.summary,
+        Document.status, Document.has_real_pages,
+    ).order_by(Document.uploaded_at)
+    if document_ids:
+        stmt = stmt.where(Document.id.in_(document_ids))
+    rows = (await session.execute(stmt)).fetchall()
+    return [
+        {
+            "document_id": str(r.id), "filename": r.filename, "page_count": r.page_count,
+            "summary": r.summary, "status": r.status, "has_real_pages": r.has_real_pages,
+        }
+        for r in rows
+    ]
+
+
+async def get_outline(session: AsyncSession, document_id: str) -> list[dict[str, Any]]:
+    stmt = (
+        select(
+            Section.id, Section.parent_id, Section.ordinal, Section.level, Section.title,
+            Section.path, Section.page_start, Section.page_end, Section.summary,
+            func.length(Section.body).label("body_chars"),
+        )
+        .where(Section.document_id == document_id)
+        .order_by(Section.ordinal)
+    )
+    rows = (await session.execute(stmt)).fetchall()
+    return [
+        {
+            "section_id": str(r.id), "parent_id": str(r.parent_id) if r.parent_id else None,
+            "ordinal": r.ordinal, "level": r.level, "title": r.title, "path": r.path,
+            "page_start": r.page_start, "page_end": r.page_end, "summary": r.summary,
+            "body_chars": r.body_chars or 0,
+        }
+        for r in rows
+    ]
+
+
+async def read_section(session: AsyncSession, section_id: str) -> dict[str, Any] | None:
+    """A section with its descendants' bodies concatenated in document order."""
+    root = (await session.execute(select(Section).where(Section.id == section_id))).scalar_one_or_none()
+    if root is None:
+        return None
+    rows = (await session.execute(
+        select(Section).where(Section.document_id == root.document_id).order_by(Section.ordinal)
+    )).scalars().all()
+    keep = {root.id}
+    bodies: list[str] = []
+    page_end = root.page_end
+    for s in rows:
+        if s.ordinal < root.ordinal:
+            continue
+        if s.id != root.id and s.parent_id not in keep:
+            break  # left the subtree (sections are in document order)
+        keep.add(s.id)
+        bodies.append(s.body)
+        page_end = max(page_end, s.page_end)
+    filename = (await session.execute(
+        select(Document.filename).where(Document.id == root.document_id)
+    )).scalar_one()
+    return {
+        "section_id": str(root.id), "document_id": str(root.document_id), "filename": filename,
+        "path": root.path, "page_start": root.page_start, "page_end": page_end,
+        "text": "\n\n".join(b for b in bodies if b.strip()),
+    }
+
+
+async def read_pages(
+    session: AsyncSession, document_id: str, start: int, end: int
+) -> list[dict[str, Any]]:
+    stmt = (
+        select(Page.page_number, Page.text, Document.filename)
+        .join(Document, Document.id == Page.document_id)
+        .where(Page.document_id == document_id, Page.page_number.between(start, end))
+        .order_by(Page.page_number)
+    )
+    rows = (await session.execute(stmt)).fetchall()
+    return [{"page": r.page_number, "text": r.text, "filename": r.filename, "document_id": document_id} for r in rows]
+
+
+async def keyword_scan(
+    session: AsyncSession,
+    terms: list[str],
+    document_ids: list[str] | None = None,
+    limit: int = 20,
+    window: int = 220,
+) -> list[dict[str, Any]]:
+    """Exact (case-insensitive) term matches across pages, with a snippet around each hit."""
+    terms = [t.strip() for t in terms if t and t.strip()][:8]
+    if not terms:
+        return []
+    def _like(t: str) -> str:
+        return "%" + t.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+
+    conds = [Page.text.ilike(_like(t), escape="\\") for t in terms]
+    stmt = (
+        select(Page.document_id, Page.page_number, Page.text, Document.filename)
+        .join(Document, Document.id == Page.document_id)
+        .where(or_(*conds))
+        .order_by(Document.uploaded_at, Page.page_number)
+        .limit(limit * 3)
+    )
+    if document_ids:
+        stmt = stmt.where(Page.document_id.in_(document_ids))
+    rows = (await session.execute(stmt)).fetchall()
+
+    hits: list[dict[str, Any]] = []
+    for r in rows:
+        for t in terms:
+            m = re.search(re.escape(t), r.text, re.IGNORECASE)
+            if m:
+                a, b = max(0, m.start() - window), min(len(r.text), m.end() + window)
+                hits.append({
+                    "document_id": str(r.document_id), "filename": r.filename, "page": r.page_number,
+                    "term": t, "snippet": r.text[a:b].strip(),
+                })
+        if len(hits) >= limit:
+            break
+    return hits[:limit]
+
+
+# ---------------------------------------------------------------------------
+# Document listing / deletion
+# ---------------------------------------------------------------------------
+
+
+async def get_all_documents(session: AsyncSession) -> list[dict[str, Any]]:
+    stmt = (
+        select(
+            Document.id, Document.filename, Document.file_type, Document.page_count,
+            Document.uploaded_at, Document.file_key, Document.file_url, Document.status,
+            Document.stage, Document.error, Document.summary,
+            func.count(Chunk.id).label("chunk_count"),
+        )
+        .outerjoin(Chunk, Chunk.document_id == Document.id)
+        .group_by(Document.id)
+        .order_by(Document.uploaded_at.desc())
+    )
+    rows = (await session.execute(stmt)).fetchall()
+    return [dict(r._mapping) for r in rows]
+
+
+async def get_document_status(session: AsyncSession, document_id: str) -> dict[str, Any] | None:
+    doc = (await session.execute(select(Document).where(Document.id == document_id))).scalar_one_or_none()
+    if doc is None:
+        return None
+    chunk_count = (await session.execute(
+        select(func.count(Chunk.id)).where(Chunk.document_id == document_id)
+    )).scalar_one()
+    section_count = (await session.execute(
+        select(func.count(Section.id)).where(Section.document_id == document_id)
+    )).scalar_one()
+    return {
+        "document_id": str(doc.id), "filename": doc.filename, "status": doc.status, "stage": doc.stage,
+        "error": doc.error, "page_count": doc.page_count, "section_count": section_count,
+        "chunk_count": chunk_count, "summary": doc.summary,
+    }
+
+
+async def get_document_chunks(
+    session: AsyncSession,
+    document_id: str,
+) -> tuple[str | None, list[dict[str, Any]]]:
+    filename = (await session.execute(
+        select(Document.filename).where(Document.id == document_id)
+    )).scalar_one_or_none()
+    if filename is None:
+        return None, []
+    rows = (await session.execute(
+        select(
+            Chunk.chunk_index, Chunk.text, Chunk.start_char, Chunk.end_char,
+            Chunk.page_start, Chunk.page_end, Chunk.section_path,
+        )
+        .where(Chunk.document_id == document_id)
+        .order_by(Chunk.chunk_index)
+    )).fetchall()
+    return filename, [dict(r._mapping) for r in rows]
+
+
+async def delete_document(session: AsyncSession, document_id: str) -> Document | None:
+    """Delete a document; pages, sections and chunks cascade. Returns the deleted row."""
+    doc = (await session.execute(select(Document).where(Document.id == document_id))).scalar_one_or_none()
+    if doc is None:
+        return None
+    await session.delete(doc)
+    await session.flush()
+    logger.info("Deleted document id=%s", document_id)
+    return doc
+
+
+async def fail_interrupted(session: AsyncSession) -> int:
+    """Mark documents left in 'processing' by a restart as failed."""
+    result = await session.execute(
+        update(Document)
+        .where(Document.status == "processing")
+        .values(status="failed", error="Indexing was interrupted by a server restart. Upload again.")
+    )
+    return result.rowcount or 0
