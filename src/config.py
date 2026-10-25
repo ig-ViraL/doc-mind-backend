@@ -50,11 +50,18 @@ class Settings(BaseSettings):
     # Must match the provider: local MiniLM=384, voyage-3-lite=512, voyage-3/voyage-3-large=1024
     embedding_dim: int = 384
 
+    # LLM call limits
+    llm_timeout_s: float = 60.0
+    llm_max_retries: int = 2
+
     # RAG parameters
     top_k: int = 5          # chunks sent to LLM (context window size)
-    retrieval_k: int = 12   # candidate pool fetched + reranked before truncation
-    chunk_size: int = 512
-    chunk_overlap: int = 50
+    retrieval_k: int = 50   # candidate pool fetched + reranked before truncation
+    chunk_size: int = 400   # tokens (embedding model tokenizer when loaded)
+    chunk_overlap: int = 60 # tokens
+
+    # HNSW search breadth (higher = better recall, slower). Must be >= retrieval_k.
+    hnsw_ef_search: int = 100
 
     # Hybrid search — Reciprocal Rank Fusion constant.
     # Higher values reduce the ranking advantage of top results.

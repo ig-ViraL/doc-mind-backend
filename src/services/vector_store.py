@@ -110,13 +110,14 @@ async def similarity_search(
     Returns a list of dicts with keys:
         chunk_index, text, similarity, document_id, filename
     """
-    # Build the query vector literal for pgvector
-    vector_literal = "[" + ",".join(str(v) for v in query_embedding) + "]"
+    from config import settings
 
-    # cosine distance: embedding <=> query_vector  (0 = identical, 2 = opposite)
-    # similarity = 1 - distance
-    distance_expr = text(f"chunks.embedding <=> '{vector_literal}'::vector")
-    similarity_expr = literal_column(f"1 - (chunks.embedding <=> '{vector_literal}'::vector)")
+    # cosine distance: 0 = identical, 2 = opposite; similarity = 1 - distance
+    distance_expr = Chunk.embedding.cosine_distance(query_embedding)
+
+    # HNSW only returns ef_search candidates; keep it above the requested k.
+    ef_search = max(int(settings.hnsw_ef_search), k)
+    await session.execute(text(f"SET LOCAL hnsw.ef_search = {ef_search}"))
 
     stmt = (
         select(
@@ -125,7 +126,7 @@ async def similarity_search(
             Chunk.document_id,
             Chunk.id.label("chunk_id"),
             Document.filename,
-            similarity_expr.label("similarity"),
+            (1 - distance_expr).label("similarity"),
         )
         .join(Document, Chunk.document_id == Document.id)
         .where(Chunk.embedding.isnot(None))
@@ -368,7 +369,7 @@ async def hybrid_search(
     Returns a list of dicts (same shape as similarity_search) with
     ``similarity`` set to the fused RRF score.
     """
-    fetch_k = min(k * 3, 50)  # over-fetch so fusion has enough candidates
+    fetch_k = min(k * 2, 200)  # over-fetch so fusion has enough candidates
 
     vector_hits = await similarity_search(
         session, query_embedding, k=fetch_k, document_ids=document_ids

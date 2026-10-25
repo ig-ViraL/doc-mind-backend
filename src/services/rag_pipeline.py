@@ -12,6 +12,7 @@ Flow:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import time
@@ -182,7 +183,8 @@ async def _retrieve(
         document_ids=document_ids,
         rrf_k=settings.rrf_k,
     )
-    reranked_chunks = _rerank(query, raw_chunks)
+    # The cross-encoder is CPU/GPU-bound; run it in a worker thread so other requests keep flowing.
+    reranked_chunks = await asyncio.to_thread(_rerank, query, raw_chunks)
     ranked_chunks = reranked_chunks[:k]
     logger.info(
         "Retrieved %d candidates, sending top %d to the LLM",

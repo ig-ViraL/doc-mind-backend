@@ -93,6 +93,16 @@ class Embedder:
         return all_embeddings
 
 
+    def count_tokens(self, text: str) -> int:
+        """Token count using the local model's tokenizer when loaded, else an approximation."""
+        from services.chunker import approx_token_count
+
+        tokenizer = getattr(self._client, "tokenizer", None)
+        if tokenizer is None:
+            return approx_token_count(text)
+        return len(tokenizer.encode(text, add_special_tokens=False))
+
+
 embedder = Embedder()
 
 

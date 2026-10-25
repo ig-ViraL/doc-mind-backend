@@ -117,12 +117,13 @@ class Chunk(Base):
     document: Mapped["Document"] = relationship("Document", back_populates="chunks")
 
     __table_args__ = (
-        # IVFFlat index for approximate nearest-neighbour search (cosine distance)
+        # HNSW index for approximate nearest-neighbour search (cosine distance).
+        # Unlike IVFFlat it needs no training data, so recall stays good on small/new tables.
         Index(
-            "ix_chunks_embedding_ivfflat",
+            "ix_chunks_embedding_hnsw",
             "embedding",
-            postgresql_using="ivfflat",
-            postgresql_with={"lists": 100},
+            postgresql_using="hnsw",
+            postgresql_with={"m": 16, "ef_construction": 64},
             postgresql_ops={"embedding": "vector_cosine_ops"},
         ),
     )
@@ -161,16 +162,15 @@ async def init_db() -> None:
                     current_type, target_type,
                 )
                 await conn.execute(text("DROP INDEX IF EXISTS ix_chunks_embedding_ivfflat"))
+                await conn.execute(text("DROP INDEX IF EXISTS ix_chunks_embedding_hnsw"))
                 await conn.execute(text("UPDATE chunks SET embedding = NULL"))
                 await conn.execute(text(
                     f"ALTER TABLE chunks ALTER COLUMN embedding TYPE {target_type}"
                 ))
-                await conn.execute(text(
-                    "CREATE INDEX IF NOT EXISTS ix_chunks_embedding_ivfflat "
-                    "ON chunks USING ivfflat (embedding vector_cosine_ops) "
-                    "WITH (lists = 100)"
-                ))
                 logger.info("Embedding column migrated to %s", target_type)
+
+        # The old IVFFlat index is replaced by HNSW (created by create_all below).
+        await conn.execute(text("DROP INDEX IF EXISTS ix_chunks_embedding_ivfflat"))
 
         # Add file storage columns to existing documents table (idempotent)
         await conn.execute(text(

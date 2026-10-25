@@ -33,8 +33,8 @@ services:
       EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-local}
       EMBEDDING_DIM: ${EMBEDDING_DIM:-384}
       TOP_K: ${TOP_K:-5}
-      CHUNK_SIZE: ${CHUNK_SIZE:-512}
-      CHUNK_OVERLAP: ${CHUNK_OVERLAP:-50}
+      CHUNK_SIZE: ${CHUNK_SIZE:-400}
+      CHUNK_OVERLAP: ${CHUNK_OVERLAP:-60}
     ports:
       - "8000:8000"
     volumes:

@@ -15,6 +15,7 @@ import logging
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from config import settings
 from db.database import get_db
 from models.schemas import (
     ChunkResponse,
@@ -33,7 +34,11 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["documents"])
 
-_chunker = chunker_module.RecursiveCharacterChunker()
+_chunker = chunker_module.TokenChunker(
+    chunk_size=settings.chunk_size,
+    chunk_overlap=settings.chunk_overlap,
+    token_counter=embedder.count_tokens,
+)
 
 
 # ---------------------------------------------------------------------------

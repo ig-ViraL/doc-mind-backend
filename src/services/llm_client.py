@@ -18,6 +18,8 @@ def get_openrouter_client() -> openai.AsyncOpenAI:
         _client = openai.AsyncOpenAI(
             api_key=settings.openrouter_api_key,
             base_url=settings.openrouter_base_url,
+            timeout=settings.llm_timeout_s,
+            max_retries=settings.llm_max_retries,
             default_headers={
                 "HTTP-Referer": "https://github.com/docmind",
                 "X-Title": "DocMind RAG",
