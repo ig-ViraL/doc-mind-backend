@@ -86,7 +86,7 @@ async def parse_bytes(raw_bytes: bytes, filename: str, content_type: str = "") -
 
 
 def _sync_extract_pdf(raw_bytes: bytes) -> dict[str, Any]:
-    import fitz  # pymupdf
+    import pymupdf as fitz
     import pdfplumber
 
     doc = fitz.open(stream=raw_bytes, filetype="pdf")

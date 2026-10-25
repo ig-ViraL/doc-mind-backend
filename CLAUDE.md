@@ -3,92 +3,76 @@
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Project Overview
-Production-ready RAG (Retrieval-Augmented Generation) backend for document Q&A. Users upload PDFs, DOCX, or TXT files; the system chunks, embeds, stores in pgvector, and answers natural language queries with cited sources.
+Agentic RAG backend for document Q&A over long documents. Users upload PDF / DOCX / TXT / MD files; the system stores pages, a section tree, summaries and section-aware chunks in Postgres + pgvector, then answers questions in one of four modes (auto, fast, deep, exhaustive) with page-level citations checked against evidence.
 
-**Backend only** — frontend is a separate project.
+**Backend only** — the frontend is a separate project. This is a local demo: no auth, tenancy or rate limiting by design.
 
 ## Tech Stack
-- **Runtime**: Python, FastAPI (async)
-- **LLM**: OpenRouter API (OpenAI-compatible) — default model `anthropic/claude-3.5-sonnet`, called via `openai` SDK
-- **Embeddings**: `sentence-transformers` (`all-MiniLM-L6-v2`, 384 dims)
-- **Vector Store**: PostgreSQL + pgvector extension
-- **ORM**: SQLAlchemy (async) + asyncpg
-- **Document Parsing**: pypdf, python-docx, unstructured
-- **Containerization**: Docker Compose
+- **Runtime**: Python 3.11+, FastAPI (async)
+- **LLMs** (OpenRouter via the `openai` SDK): `OPENROUTER_MODEL` (default `anthropic/claude-sonnet-4.5`) plans and answers; `FAST_MODEL` (default `anthropic/claude-haiku-4.5`) does summaries, routing, the map step and checking
+- **Embeddings**: `Qwen/Qwen3-Embedding-0.6B` (1024-d) via sentence-transformers, MPS/CUDA/CPU auto, fp16 on GPU, instruction prompt on queries only
+- **Reranker**: `BAAI/bge-reranker-v2-m3` cross-encoder, same device logic
+- **Store**: PostgreSQL + pgvector (HNSW cosine index) + GIN full-text indexes
+- **ORM**: SQLAlchemy 2 async + asyncpg
+- **Parsing**: pymupdf (text, outline, fonts, images, links), pdfplumber (tables), python-docx, unstructured fallback
 
 ## Development Commands
 
-All commands run from `src/`:
-
 ```bash
-# Start only Postgres (preferred during development)
-docker-compose up postgres -d
-
-# Install dependencies
-cd src
+docker-compose up postgres -d          # Postgres + pgvector on :5433
 pip install -r requirements.txt
+cp .env.example .env                   # repo root or src/ — both are read
 
-# Run the dev server (hot-reload)
-uvicorn main:app --reload --host 0.0.0.0 --port 8000
+cd src && uvicorn main:app --reload --port 8000
 
-# Run tests
-cd src
-pytest
-
-# Run a single test file
-pytest tests/test_chunker.py -v
-
-# Start the full stack (Postgres + backend) via Docker
-docker-compose up --build
+python -m pytest -q                    # from repo root; no DB/GPU/API key needed
+python scripts/reindex.py              # after changing embedding model or EMBEDDING_DIM
+python scripts/eval.py --pdf X.pdf --questions q.json   # page recall + citation accuracy
 ```
 
 ## API Endpoints
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/api/documents/upload` | Upload & index a document |
-| GET | `/api/documents` | List all indexed documents |
-| DELETE | `/api/documents/{document_id}` | Delete document + chunks |
-| POST | `/api/query` | Ask a question, get answer + citations |
-| GET | `/health` | Simple liveness check |
-| GET | `/api/status` | Uptime, config, and DB connectivity |
-
-## Environment Variables
-
-Copy `src/.env.example` to `src/.env`. Required:
-
-```
-OPENROUTER_API_KEY=sk-or-...          # Required — from openrouter.ai/keys
-OPENROUTER_MODEL=anthropic/claude-3.5-sonnet  # Optional — any OpenRouter model slug
-DATABASE_URL=postgresql+asyncpg://docmind:secret@localhost:5432/docmind
-EMBEDDING_MODEL=all-MiniLM-L6-v2
-TOP_K=5
-CHUNK_SIZE=512      # Character count (not tokens)
-CHUNK_OVERLAP=50    # Character overlap
-```
+| POST | `/api/documents/upload` | Store file, index in background → 202 `{document_id, status: processing}` |
+| GET | `/api/documents/{id}/status` | `processing` + stage, `ready`, or `failed` + error |
+| GET | `/api/documents/{id}/outline` | Section tree with pages and summaries |
+| GET | `/api/documents/{id}/pages/{n}` | One page's text |
+| GET | `/api/documents` | List documents |
+| GET | `/api/documents/{id}/chunks` | Chunks with pages and section paths |
+| DELETE | `/api/documents/{id}` | Delete document (pages/sections/chunks cascade) |
+| POST | `/api/query` | `{query, document_ids?, k?, mode?}` → answer, sources, citations, steps, budget |
+| POST | `/api/query/stream` | SSE: `mode`, `step`…, `sources`, `token`…, `citations`, `done` (`error` on failure) |
+| GET | `/health`, `/api/status` | Liveness; config, DB status, `reindex_required` |
 
 ## Architecture
 
-### RAG Pipeline Flow (`services/rag_pipeline.py`)
-1. Embed query via `SentenceTransformer` → 384-dim vector
-2. Cosine similarity search in pgvector (`top-K` chunks)
-3. Cross-encoder reranking via `cross-encoder/ms-marco-MiniLM-L-6-v2` (lazy-loaded; degrades gracefully if unavailable)
-4. Build context string with `Chunk N (from filename):` labels
-5. Call OpenRouter via `openai.AsyncOpenAI` with a strict system prompt
-6. Return `QueryResponse` with answer, `SourceChunk` list, and `latency_ms`
+### Upload (`services/indexer.py`, background task)
+`parser.parse_bytes` → `ParsedDocument(pages, headings)` → `structure.assemble` / `locate_headings` / `build_sections` → `structure.chunk_sections` (TokenChunker per section body, `Document: … / Section: …` header) → `embedder.embed(header + text)` → save pages, sections, chunks → `summarizer.summarize` (cheap model) → status `ready`.
+Status/stage live on the `documents` row. Jobs left `processing` by a restart are marked `failed` at startup.
+
+### Query (`services/rag_pipeline.py`)
+`stream_answer()` is the single code path; `answer_query()` collects its events into a `QueryResponse`.
+1. Meta-query guard (identity/chitchat → fixed intro, no retrieval)
+2. `mode=auto` → `agent/router.route`: regex rules first, cheap model for ambiguous questions
+3. **fast**: `retrieval.retrieve` (embed → `vector_store.hybrid_search` (HNSW + FTS, RRF) → bge rerank in a thread → top-k) → streamed answer
+4. **deep**: `agent/deep.run_deep` — tool loop with `agent/tools.TOOL_SPECS` against an `agent/store.DocStore`; passages get ids `P1…`, sections `S1…`, documents `D1…` (`agent/workspace.py`)
+5. **exhaustive**: `agent/exhaustive.run_exhaustive` — `build_map_units` packs section bodies, cheap model extracts quoted findings per unit, `MAP_CONCURRENCY` at a time
+6. Deep/exhaustive: `agent/answer.generate` from evidence only (numbered `[n]`) → `agent/answer.check` removes unsupported sentences → `citations` maps used markers to pages
+7. `Budget` (steps, tokens, seconds) bounds deep and exhaustive; each tool call / map batch is one step
 
 ### Key Design Decisions
-- **OpenRouter via `openai` SDK**: `_get_openrouter_client()` creates an `AsyncOpenAI` singleton pointed at `openrouter_base_url`. To swap models, change `OPENROUTER_MODEL` — no code changes needed.
-- **Two chunkers**: `RecursiveCharacterChunker` (default, character-based with separator hierarchy) and `SemanticChunker` (embedding-based sentence grouping). Only `RecursiveCharacterChunker` is wired into `api/documents.py`; `SemanticChunker` is available but not active.
-- **ORM models live in `db/database.py`**: `Document` and `Chunk` ORM classes, `init_db()` creates the pgvector extension and tables on startup via `Base.metadata.create_all`.
-- **IVFFlat index**: `chunks.embedding` has `postgresql_using="ivfflat"`, `lists=100`, `vector_cosine_ops` for ANN search.
-- **Config via `pydantic-settings`**: `src/config.py` exposes a `settings` singleton loaded from `.env`. All services import from here.
-
-### Data Flow for Upload
-`POST /api/documents/upload` → parse (pypdf / python-docx / unstructured) → `RecursiveCharacterChunker.chunk()` → `Embedder.embed()` (batch) → `vector_store.save_document()` + `vector_store.save_chunks()`
+- **One SSE generator**: blocking and streaming endpoints share `stream_answer`, so they can't drift.
+- **`DocStore` interface**: tools never touch SQL directly; `PgStore` implements it, `tests/fakes.FakeStore` replaces it in tests along with `ScriptedLLM` (monkeypatched over `services.llm.chat`).
+- **`services/llm.chat`** returns content, tool calls and token usage; every LLM call in the agent goes through it so budgets are enforced. Fast-mode streaming uses `llm_client.get_openrouter_client()` directly.
+- **No silent re-embedding**: `init_db()` only flags a vector-dimension mismatch (`database.embedding_dim_mismatch`); uploads return 409 until `scripts/reindex.py` runs.
+- **Schema migrations** are idempotent `ALTER TABLE … ADD COLUMN IF NOT EXISTS` in `init_db()` plus `create_all`.
+- **Config** is `src/config.py` (`settings` singleton); `.env` is read from repo root, `src/`, or cwd.
 
 ## Coding Standards
-- Use `async/await` throughout — no blocking I/O
-- Pydantic v2 models for all request/response schemas (`model_config = {"from_attributes": True}` where reading ORM objects)
-- FastAPI dependency injection for DB sessions (`Depends(get_db)`)
-- No print statements — use `logging.getLogger(__name__)`
+- `async/await` throughout; blocking work (models, parsing) via `asyncio.to_thread`
+- Pydantic v2 schemas for all request/response bodies
+- FastAPI `Depends(get_db)` for request sessions; background jobs open their own `AsyncSessionLocal()`
+- `vector_store` functions never commit; callers own the transaction
+- No print statements in `src/` — use `logging.getLogger(__name__)`
 - Type hints on all functions
+- New agent behaviour gets a test in `tests/test_agent_*.py` using the fakes
