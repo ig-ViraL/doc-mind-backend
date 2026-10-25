@@ -27,6 +27,9 @@ from config import settings
 
 logger = logging.getLogger(__name__)
 
+# (current_type, expected_type) when the stored vectors don't match EMBEDDING_DIM.
+embedding_dim_mismatch: tuple[str, str] | None = None
+
 # ---------------------------------------------------------------------------
 # Engine & session factory
 # ---------------------------------------------------------------------------
@@ -141,9 +144,11 @@ async def init_db() -> None:
         await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
         logger.info("pgvector extension ensured")
 
-        # Migrate embedding column dimension if the table already exists with wrong dim.
-        # This happens when switching embedding models (e.g. all-MiniLM-L6-v2 → Voyage AI).
-        # Old embeddings are incompatible anyway, so we NULL them out and retype the column.
+        # Detect an embedding column whose dimension doesn't match the configured model.
+        # We never wipe embeddings at startup: re-embedding is an explicit step
+        # (`python scripts/reindex.py`) so a config typo can't destroy the index.
+        global embedding_dim_mismatch
+        embedding_dim_mismatch = None
         result = await conn.execute(text(
             "SELECT format_type(atttypid, atttypmod) "
             "FROM pg_attribute "
@@ -157,17 +162,12 @@ async def init_db() -> None:
             current_type = row[0]  # e.g. "vector(384)"
             target_type = f"vector({settings.embedding_dim})"
             if current_type != target_type:
-                logger.info(
-                    "Embedding column is %s — migrating to %s (old embeddings cleared)",
+                embedding_dim_mismatch = (current_type, target_type)
+                logger.error(
+                    "Embedding column is %s but EMBEDDING_DIM expects %s. Uploads and vector "
+                    "search are disabled until you run `python scripts/reindex.py`.",
                     current_type, target_type,
                 )
-                await conn.execute(text("DROP INDEX IF EXISTS ix_chunks_embedding_ivfflat"))
-                await conn.execute(text("DROP INDEX IF EXISTS ix_chunks_embedding_hnsw"))
-                await conn.execute(text("UPDATE chunks SET embedding = NULL"))
-                await conn.execute(text(
-                    f"ALTER TABLE chunks ALTER COLUMN embedding TYPE {target_type}"
-                ))
-                logger.info("Embedding column migrated to %s", target_type)
 
         # The old IVFFlat index is replaced by HNSW (created by create_all below).
         await conn.execute(text("DROP INDEX IF EXISTS ix_chunks_embedding_ivfflat"))

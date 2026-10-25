@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import settings
 from models.schemas import QueryResponse, SourceChunk
-from services.embedder import embedder
+from services.embedder import embedder, embedding_text
 from services.llm_client import get_openrouter_client
 from services.vector_store import hybrid_search
 
@@ -88,8 +88,18 @@ def _get_cross_encoder() -> Any:
         try:
             from sentence_transformers import CrossEncoder
 
-            logger.info("Loading cross-encoder model: %s", settings.cross_encoder_model)
-            _cross_encoder = CrossEncoder(settings.cross_encoder_model)
+            from services.devices import pick_device, use_fp16
+
+            device = pick_device(settings.reranker_device)
+            logger.info("Loading cross-encoder %s on %s", settings.cross_encoder_model, device)
+            ce = CrossEncoder(
+                settings.cross_encoder_model,
+                device=device,
+                max_length=settings.reranker_max_length,
+            )
+            if use_fp16(device, settings.reranker_fp16):
+                ce.model.half()
+            _cross_encoder = ce
             logger.info("Cross-encoder model loaded")
         except Exception as exc:
             logger.warning("Failed to load cross-encoder (%s) — reranking disabled", exc)
@@ -108,8 +118,11 @@ def _rerank(query: str, chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return chunks
 
     try:
-        pairs = [(query, c["text"]) for c in chunks]
-        scores: list[float] = cross_encoder.predict(pairs).tolist()
+        pairs = [(query, embedding_text(c.get("header"), c["text"])) for c in chunks]
+        scores: list[float] = [
+            float(s)
+            for s in cross_encoder.predict(pairs, batch_size=settings.reranker_batch_size)
+        ]
         ranked = sorted(zip(scores, chunks), key=lambda x: x[0], reverse=True)
         reranked = [chunk for _, chunk in ranked]
         logger.debug("Reranked %d chunks", len(reranked))

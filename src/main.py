@@ -151,8 +151,12 @@ async def server_status() -> dict:
         db_error = str(exc)
         logger.warning("Status check — DB unreachable: %s", exc)
 
+    from db import database
+
+    mismatch = database.embedding_dim_mismatch
     return {
-        "status": "ok" if db_status == "ok" else "degraded",
+        "status": "ok" if db_status == "ok" and not mismatch else "degraded",
+        "reindex_required": bool(mismatch),
         "version": app.version,
         "uptime_seconds": uptime_seconds,
         "database": db_status,
@@ -160,6 +164,7 @@ async def server_status() -> dict:
         "config": {
             "embedding_provider": settings.embedding_provider,
             "embedding_model": settings.local_embedding_model if settings.embedding_provider == "local" else settings.voyage_model,
+            "reranker_model": settings.cross_encoder_model,
             "embedding_dim": settings.embedding_dim,
             "top_k": settings.top_k,
             "chunk_size": settings.chunk_size,

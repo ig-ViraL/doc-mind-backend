@@ -62,6 +62,16 @@ async def upload_document(
     """
     logger.info("Upload request: filename='%s' content_type='%s'", file.filename, file.content_type)
 
+    from db import database
+
+    if database.embedding_dim_mismatch:
+        current, expected = database.embedding_dim_mismatch
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Stored vectors are {current} but the model expects {expected}. "
+            "Run `python scripts/reindex.py` first.",
+        )
+
     # 1. Read bytes upfront (needed for R2 upload; seek back so parser can read normally)
     file_bytes = await file.read()
     await file.seek(0)

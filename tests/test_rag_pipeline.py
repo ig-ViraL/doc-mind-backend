@@ -34,7 +34,7 @@ def test_rerank_orders_by_score_and_degrades_gracefully(monkeypatch):
     chunks = [_chunk(0, "low"), _chunk(1, "high")]
 
     class FakeCE:
-        def predict(self, pairs):
+        def predict(self, pairs, **kw):
             import numpy as np
             return np.array([0.1 if "low" in p[1] else 0.9 for p in pairs])
 
@@ -42,7 +42,7 @@ def test_rerank_orders_by_score_and_degrades_gracefully(monkeypatch):
     assert [c["text"] for c in rp._rerank("q", chunks)] == ["high", "low"]
 
     class Broken:
-        def predict(self, pairs):
+        def predict(self, pairs, **kw):
             raise RuntimeError("boom")
 
     monkeypatch.setattr(rp, "_cross_encoder", Broken())

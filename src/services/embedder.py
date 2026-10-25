@@ -2,10 +2,16 @@
 Pluggable async embedder (singleton).
 
 Providers (``EMBEDDING_PROVIDER``):
-  local  — sentence-transformers ``all-MiniLM-L6-v2`` (384 dims). Free, no API key, runs in-process.
+  local  — sentence-transformers model run in-process. Default ``Qwen/Qwen3-Embedding-0.6B``
+           (1024 dims) on the Mac GPU (MPS) in fp16 when available, else CUDA/CPU.
   voyage — Voyage AI API (``voyage-3-lite``, 512 dims). Needs ``VOYAGE_API_KEY``.
 
-``embedding_dim`` in config must match the provider's output size.
+``embedding_dim`` in config must match the model's output size. Changing models
+requires re-embedding stored chunks: ``python scripts/reindex.py``.
+
+Queries and documents are embedded asymmetrically: queries get the instruction
+prompt from ``EMBEDDING_QUERY_PROMPT`` (what Qwen3-Embedding is trained with);
+documents are embedded as-is.
 """
 
 from __future__ import annotations
@@ -14,9 +20,16 @@ import asyncio
 import logging
 from typing import Any, Literal
 
+from services.devices import pick_device, use_fp16
+
 logger = logging.getLogger(__name__)
 
 _BATCH_SIZE = 128  # Voyage AI per-request limit
+
+
+def embedding_text(header: str | None, text: str) -> str:
+    """The exact string a chunk is embedded (and reranked) with: section header + body."""
+    return f"{header}\n\n{text}" if header else text
 
 
 class Embedder:
@@ -33,8 +46,23 @@ class Embedder:
             from sentence_transformers import SentenceTransformer
             from config import settings
 
-            logger.info("Loading local embedding model: %s", settings.local_embedding_model)
-            self._client = SentenceTransformer(settings.local_embedding_model)
+            device = pick_device(settings.embedding_device)
+            logger.info(
+                "Loading local embedding model %s on %s", settings.local_embedding_model, device
+            )
+            model = SentenceTransformer(settings.local_embedding_model, device=device)
+            model.max_seq_length = settings.embedding_max_seq_length
+            if use_fp16(device, settings.embedding_fp16):
+                model.half()
+                logger.info("Embedding model running in fp16")
+            dim = model.get_sentence_embedding_dimension()
+            if dim and dim != settings.embedding_dim:
+                raise RuntimeError(
+                    f"{settings.local_embedding_model} outputs {dim}-dim vectors but "
+                    f"EMBEDDING_DIM={settings.embedding_dim}. Fix EMBEDDING_DIM, then run "
+                    "`python scripts/reindex.py`."
+                )
+            self._client = model
         return self._client
 
     def _get_client(self) -> Any:
@@ -44,11 +72,9 @@ class Embedder:
             return self._get_local_model()
         if self._client is None:
             import voyageai
-            from config import settings
+
             if not settings.voyage_api_key:
-                raise RuntimeError(
-                    "VOYAGE_API_KEY is not set — add it to your .env file"
-                )
+                raise RuntimeError("VOYAGE_API_KEY is not set — add it to your .env file")
             logger.info("Initializing Voyage AI client (model: %s)", settings.voyage_model)
             self._client = voyageai.AsyncClient(api_key=settings.voyage_api_key)
         return self._client
@@ -58,7 +84,7 @@ class Embedder:
         texts: list[str],
         input_type: Literal["document", "query"] = "document",
     ) -> list[list[float]]:
-        """Batch-embed texts via Voyage AI API; returns one float vector per input."""
+        """Batch-embed texts; returns one normalised float vector per input."""
         if not texts:
             return []
 
@@ -66,32 +92,23 @@ class Embedder:
         from config import settings
 
         if settings.embedding_provider == "local":
-            # CPU-bound: keep it off the event loop.
-            vectors = await asyncio.to_thread(
-                client.encode, texts, normalize_embeddings=True, batch_size=32
-            )
-            return vectors.tolist()
+            kwargs: dict[str, Any] = {
+                "normalize_embeddings": True,
+                "batch_size": settings.embedding_batch_size,
+                "convert_to_numpy": True,
+            }
+            if input_type == "query" and settings.embedding_query_prompt:
+                kwargs["prompt"] = settings.embedding_query_prompt
+            # GPU/CPU-bound: keep it off the event loop.
+            vectors = await asyncio.to_thread(client.encode, texts, **kwargs)
+            return vectors.astype("float32").tolist()
 
         all_embeddings: list[list[float]] = []
-        total_batches = -(-len(texts) // _BATCH_SIZE)  # ceiling division
         for i in range(0, len(texts), _BATCH_SIZE):
             batch = texts[i : i + _BATCH_SIZE]
-            logger.debug(
-                "Embedding batch %d/%d (%d texts, input_type=%s)",
-                i // _BATCH_SIZE + 1,
-                total_batches,
-                len(batch),
-                input_type,
-            )
-            result = await client.embed(
-                batch,
-                model=settings.voyage_model,
-                input_type=input_type,
-            )
+            result = await client.embed(batch, model=settings.voyage_model, input_type=input_type)
             all_embeddings.extend(result.embeddings)
-
         return all_embeddings
-
 
     def count_tokens(self, text: str) -> int:
         """Token count using the local model's tokenizer when loaded, else an approximation."""
