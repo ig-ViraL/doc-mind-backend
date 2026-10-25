@@ -34,7 +34,8 @@ _DEEP_RE = re.compile(
     r"\b(compare|comparison|contrast|differ|difference|versus|vs\.?|why|how (does|do|did|is|are)|explain|"
     r"relationship|relate|impact|effect of|cause|trace|timeline|evolve|change[sd]? (over|between)|"
     r"(which|what) (chapter|section|page|appendix)|in (chapter|section|appendix) \w+|"
-    r"according to (chapter|section)|consistent|contradict|both|step[- ]by[- ]step)\b",
+    r"according to (chapter|section)|consistent|contradict|both|step[- ]by[- ]step|"
+    r"(section|chapter|appendix|part|clause|article) [0-9ivxlc]+(\.[0-9]+)*)\b",
     re.IGNORECASE,
 )
 

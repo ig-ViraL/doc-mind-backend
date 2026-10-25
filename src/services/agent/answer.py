@@ -99,7 +99,8 @@ def split_sentences(answer: str) -> list[str]:
 
 
 def _is_claim(segment: str) -> bool:
-    return sum(c.isalpha() for c in segment) >= 12
+    """A sentence that states something (not a bare heading, bullet marker or blank)."""
+    return sum(c.isalpha() for c in segment) >= 6 and len(segment.split()) >= 2
 
 
 def remove_sentences(answer: str, numbers: set[int]) -> tuple[str, list[str]]:
@@ -124,6 +125,7 @@ def remove_sentences(answer: str, numbers: set[int]) -> tuple[str, list[str]]:
                 continue
         out.append(part)
     text = "".join(out)
+    text = re.sub(r"[ \t]+\n", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     return text, removed
 

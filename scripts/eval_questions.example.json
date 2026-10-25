@@ -1,0 +1,19 @@
+[
+  {
+    "question": "What is the total revenue reported for the most recent year?",
+    "pages": [42]
+  },
+  {
+    "question": "Who is the chief financial officer?",
+    "pages": [7]
+  },
+  {
+    "question": "How did operating costs change between the two years, and why?",
+    "pages": [44, 45, 61]
+  },
+  {
+    "question": "List every risk factor named in the report.",
+    "pages": [12, 13, 14, 88],
+    "modes": ["deep", "exhaustive"]
+  }
+]
