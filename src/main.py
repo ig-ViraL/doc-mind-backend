@@ -59,6 +59,10 @@ LOGGING_CONFIG: dict = {
         "uvicorn.error": {"level": "INFO"},
         "uvicorn.access": {"level": "WARNING"},
         "sqlalchemy.engine": {"level": "WARNING"},
+        # Model downloads log every HTTP request at INFO.
+        "httpx": {"level": "WARNING"},
+        "httpx2": {"level": "WARNING"},
+        "huggingface_hub": {"level": "WARNING"},
     },
 }
 

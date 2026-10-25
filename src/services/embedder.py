@@ -55,7 +55,8 @@ class Embedder:
             if use_fp16(device, settings.embedding_fp16):
                 model.half()
                 logger.info("Embedding model running in fp16")
-            dim = model.get_sentence_embedding_dimension()
+            get_dim = getattr(model, "get_embedding_dimension", None) or model.get_sentence_embedding_dimension
+            dim = get_dim()
             if dim and dim != settings.embedding_dim:
                 raise RuntimeError(
                     f"{settings.local_embedding_model} outputs {dim}-dim vectors but "
